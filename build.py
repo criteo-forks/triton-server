@@ -1681,15 +1681,20 @@ def create_docker_build_script(script_name, container_install_dir, container_ci_
         if not FLAGS.no_container_interactive:
             runargs += ["-it"]
 
-        runargs += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
-        if FLAGS.use_user_docker_config:
-            if os.path.exists(FLAGS.use_user_docker_config):
-                runargs += [
-                    "-v",
-                    os.path.expanduser(
-                        FLAGS.use_user_docker_config + ":/root/.docker/config.json"
-                    ),
-                ]
+        if target_platform() == "windows":
+            if FLAGS.container_memory:
+                runargs += ["--memory", FLAGS.container_memory]
+            runargs += ["-v", "\\\\.\\pipe\\docker_engine:\\\\.\\pipe\\docker_engine"]
+        else:
+            runargs += docker_socket_runargs()
+            if FLAGS.use_user_docker_config:
+                if os.path.exists(FLAGS.use_user_docker_config):
+                    runargs += [
+                        "-v",
+                        os.path.expanduser(
+                            FLAGS.use_user_docker_config + ":/root/.docker/config.json"
+                        ),
+                    ]
 
         # TRI-1118 — propagate TRITON_RELEASE_VERSION into the wheel build
         # only when it was actually set in main() (release-semantic version
@@ -2176,6 +2181,18 @@ def cibase_build(
 def finalize_build(cmake_script, install_dir, ci_dir):
     cmake_script.cmd(f"chmod -R u+rwX,go+rX,go-w {install_dir}")
     cmake_script.cmd(f"chmod -R u+rwX,go+rX,go-w {ci_dir}")
+
+
+def docker_socket_runargs():
+    docker_host = os.getenv("DOCKER_HOST")
+    if docker_host is None:
+        return ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+
+    runargs = ["-e", f"DOCKER_HOST={docker_host}"]
+    if docker_host.startswith("unix://"):
+        socket_path = docker_host[len("unix://") :]
+        runargs += ["-v", f"{socket_path}:{socket_path}"]
+    return runargs
 
 
 def enable_all():
