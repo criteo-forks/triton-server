@@ -90,6 +90,28 @@ the `build.py` CUDA architecture list before ONNX Runtime backend conversion.
 The backend owns the conversion from that Triton value to ORT
 `CMAKE_CUDA_ARCHITECTURES`.
 
+## Reuse the Artifact in a Triton Build
+
+Use the unpacked `onnxruntime/` payload as `--ort-artifacts-dir` in a later
+Triton build. The path must contain `include/`, `lib/libonnxruntime.so`, and
+`triton-ort-artifact.json`.
+
+```bash
+mkdir -p /tmp/triton-ort/reuse
+tar -xzf /tmp/triton-ort/onnxruntime-*.tar.gz -C /tmp/triton-ort/reuse
+
+CUDA_ARCH_LIST="8.6" \
+python ./build.py \
+  --backend onnxruntime \
+  --ort-artifacts-dir /tmp/triton-ort/reuse/onnxruntime \
+  --enable-gpu \
+  -j 8
+```
+
+The full Triton build validates the current `build.py` CUDA architecture list
+and target machine against the artifact metadata before reusing the artifact.
+Reuse fails when either value differs.
+
 ## Common Options
 
 Control nested ORT build parallelism through the normal Triton build option:

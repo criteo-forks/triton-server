@@ -27,6 +27,7 @@
 
 import argparse
 import importlib.util
+import json
 import multiprocessing
 import os
 import os.path
@@ -608,6 +609,8 @@ def pytorch_cmake_args(images):
 
 
 def onnxruntime_cmake_args(images, library_paths):
+    validate_ort_artifact_build_config()
+
     cargs = [
         cmake_backend_arg(
             "onnxruntime",
@@ -628,6 +631,15 @@ def onnxruntime_cmake_args(images, library_paths):
         cargs.append(
             cmake_backend_arg(
                 "onnxruntime", "TRITON_CUDA_ARCH_LIST", "STRING", FLAGS.cuda_arch_list
+            )
+        )
+    if FLAGS.ort_artifacts_dir is not None:
+        cargs.append(
+            cmake_backend_arg(
+                "onnxruntime",
+                "TRITON_ONNXRUNTIME_ARTIFACTS_PATH",
+                "PATH",
+                os.path.abspath(FLAGS.ort_artifacts_dir),
             )
         )
 
@@ -2200,6 +2212,53 @@ def docker_socket_runargs():
     return runargs
 
 
+def ort_artifact_metadata():
+    if FLAGS is None or FLAGS.ort_artifacts_dir is None:
+        return None
+
+    metadata_path = os.path.join(FLAGS.ort_artifacts_dir, "triton-ort-artifact.json")
+    fail_if(
+        not os.path.isfile(metadata_path),
+        "--ort-artifacts-dir must contain triton-ort-artifact.json",
+    )
+    with open(metadata_path) as f:
+        return json.load(f)
+
+
+def ort_artifact_source_config():
+    metadata = ort_artifact_metadata()
+    if metadata is None:
+        return None
+
+    try:
+        return metadata["plan"]["source_config"]
+    except KeyError:
+        fail("--ort-artifacts-dir metadata does not record plan.source_config")
+
+
+def validate_ort_artifact_build_config():
+    artifact_config = ort_artifact_source_config()
+    if artifact_config is None:
+        return
+
+    expected = {
+        "cuda_arch_list": FLAGS.cuda_arch_list,
+        "target_machine": target_machine(),
+    }
+    for key, current_value in expected.items():
+        try:
+            artifact_value = artifact_config[key]
+        except KeyError:
+            fail(f"--ort-artifacts-dir metadata does not record {key}")
+        if artifact_value != current_value:
+            fail(
+                "ORT artifact {} does not match the current Triton "
+                "configuration: artifact has {}, current build has {}".format(
+                    key, artifact_value, current_value
+                )
+            )
+
+
 def enable_all():
     all_backends = [
         "ensemble",
@@ -2364,6 +2423,16 @@ def create_arg_parser():
         required=False,
         default=None,
         help="Specify library paths for respective backends in build as <backend-name>[:<library_path>].",
+    )
+    parser.add_argument(
+        "--ort-artifacts-dir",
+        required=False,
+        default=None,
+        help=(
+            "Path to a pre-built ONNX Runtime artifact directory. The directory "
+            "must contain include/, lib/libonnxruntime.so and "
+            "triton-ort-artifact.json."
+        ),
     )
     parser.add_argument(
         "--build-type",

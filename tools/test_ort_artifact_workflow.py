@@ -3,6 +3,7 @@
 
 import json
 import os
+import platform
 import pathlib
 import subprocess
 import sys
@@ -29,6 +30,24 @@ def run(cmd, env=None, check=True):
             )
         )
     return result
+
+
+def write_fake_artifact(path, cuda_arch_list):
+    (path / "include").mkdir(parents=True)
+    (path / "lib").mkdir()
+    (path / "lib" / "libonnxruntime.so").touch()
+    with (path / "triton-ort-artifact.json").open("w") as f:
+        json.dump(
+            {
+                "plan": {
+                    "source_config": {
+                        "cuda_arch_list": cuda_arch_list,
+                        "target_machine": platform.machine().lower(),
+                    },
+                },
+            },
+            f,
+        )
 
 
 class OrtArtifactWorkflowTest(unittest.TestCase):
@@ -98,6 +117,64 @@ class OrtArtifactWorkflowTest(unittest.TestCase):
                     sum(f"FETCHCONTENT_SOURCE_DIR_REPO-{name}" in arg for arg in cmake_args),
                     1,
                 )
+
+    def test_full_build_reuses_matching_artifact_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            artifact = tmp / "onnxruntime"
+            write_fake_artifact(artifact, "8.6")
+
+            env = os.environ.copy()
+            env["CUDA_ARCH_LIST"] = "8.6"
+            result = run(
+                [
+                    sys.executable,
+                    SERVER_DIR / "build.py",
+                    "--dryrun",
+                    "--no-container-build",
+                    "--no-core-build",
+                    "--build-dir",
+                    tmp / "build",
+                    "--install-dir",
+                    tmp / "install",
+                    "--backend",
+                    "onnxruntime",
+                    "--ort-artifacts-dir",
+                    artifact,
+                    "--enable-gpu",
+                ],
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0)
+
+            with (tmp / "build" / "cmake_build").open() as f:
+                cmake_build = f.read()
+            self.assertIn("TRITON_ONNXRUNTIME_ARTIFACTS_PATH", cmake_build)
+            self.assertIn(str(artifact), cmake_build)
+
+            env["CUDA_ARCH_LIST"] = "8.0"
+            result = run(
+                [
+                    sys.executable,
+                    SERVER_DIR / "build.py",
+                    "--dryrun",
+                    "--no-container-build",
+                    "--no-core-build",
+                    "--build-dir",
+                    tmp / "mismatch-build",
+                    "--install-dir",
+                    tmp / "mismatch-install",
+                    "--backend",
+                    "onnxruntime",
+                    "--ort-artifacts-dir",
+                    artifact,
+                    "--enable-gpu",
+                ],
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cuda_arch_list does not match", result.stderr)
 
 
 if __name__ == "__main__":
