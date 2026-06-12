@@ -678,6 +678,12 @@ def onnxruntime_cmake_args(images, library_paths):
             else FLAGS.ort_version,
         )
     ]
+    if FLAGS.build_parallel_was_explicit:
+        cargs.append(
+            cmake_backend_arg(
+                "onnxruntime", "TRITON_BUILD_PARALLEL", None, FLAGS.build_parallel
+            )
+        )
 
     # TRITON_ENABLE_GPU is already set for all backends in backend_cmake_args()
     if FLAGS.enable_gpu:
@@ -2825,6 +2831,7 @@ if __name__ == "__main__":
     if FLAGS.version is None:
         FLAGS.version = DEFAULT_TRITON_VERSION_MAP["release_version"]
 
+    FLAGS.build_parallel_was_explicit = FLAGS.build_parallel is not None
     if FLAGS.build_parallel is None:
         FLAGS.build_parallel = multiprocessing.cpu_count() * 2
 
