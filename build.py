@@ -1826,7 +1826,7 @@ def create_docker_build_script(script_name, container_install_dir, container_ci_
                 runargs += ["--memory", FLAGS.container_memory]
             runargs += ["-v", "\\\\.\\pipe\\docker_engine:\\\\.\\pipe\\docker_engine"]
         else:
-            runargs += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+            runargs += docker_socket_runargs()
             if FLAGS.use_user_docker_config:
                 if os.path.exists(FLAGS.use_user_docker_config):
                     runargs += [
@@ -2324,6 +2324,18 @@ def cibase_build(
 def finalize_build(cmake_script, install_dir, ci_dir):
     cmake_script.cmd(f"chmod -R a+rw {install_dir}")
     cmake_script.cmd(f"chmod -R a+rw {ci_dir}")
+
+
+def docker_socket_runargs():
+    docker_host = os.getenv("DOCKER_HOST")
+    if docker_host is None:
+        return ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+
+    runargs = ["-e", f"DOCKER_HOST={docker_host}"]
+    if docker_host.startswith("unix://"):
+        socket_path = docker_host[len("unix://") :]
+        runargs += ["-v", f"{socket_path}:{socket_path}"]
+    return runargs
 
 
 def enable_all():
