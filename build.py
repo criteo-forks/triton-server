@@ -684,6 +684,12 @@ def onnxruntime_cmake_args(images, library_paths):
                 "onnxruntime", "TRITON_BUILD_PARALLEL", None, FLAGS.build_parallel
             )
         )
+    if FLAGS.cuda_arch_list is not None:
+        cargs.append(
+            cmake_backend_arg(
+                "onnxruntime", "TRITON_CUDA_ARCH_LIST", "STRING", FLAGS.cuda_arch_list
+            )
+        )
 
     # TRITON_ENABLE_GPU is already set for all backends in backend_cmake_args()
     if FLAGS.enable_gpu:
@@ -2618,6 +2624,16 @@ if __name__ == "__main__":
         required=False,
         default="6.0",
         help="Minimum CUDA compute capability supported by server.",
+    )
+    parser.add_argument(
+        "--cuda-arch-list",
+        type=str,
+        required=False,
+        default=os.getenv("CUDA_ARCH_LIST"),
+        help=(
+            "CUDA architectures to pass to nested ONNX Runtime builds. "
+            "Defaults to CUDA_ARCH_LIST from the environment when set."
+        ),
     )
 
     parser.add_argument(
