@@ -12,11 +12,6 @@ import sys
 
 SERVER_DIR = pathlib.Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = SERVER_DIR.parent
-COMPONENT_FETCHCONTENT_NAMES = {
-    "common": "REPO-COMMON",
-    "core": "REPO-CORE",
-    "backend": "REPO-BACKEND",
-}
 
 
 def load_build_module():
@@ -65,44 +60,6 @@ def find_backend_source(backend_source_dir, artifact_dir, github_organization, t
         check=True,
     )
     return clone_dir.resolve()
-
-
-def parse_component_source_dirs(values):
-    source_dirs = {}
-    for value in values or []:
-        if "=" not in value:
-            raise SystemExit("--component-source-dir must be specified as <name>=<path>")
-        name, path = value.split("=", 1)
-        if name not in COMPONENT_FETCHCONTENT_NAMES:
-            raise SystemExit(
-                "--component-source-dir name must be one of {}".format(
-                    ", ".join(sorted(COMPONENT_FETCHCONTENT_NAMES))
-                )
-            )
-        source_dirs[name] = pathlib.Path(path).resolve()
-    return source_dirs
-
-
-def default_component_source_dirs(disabled):
-    if disabled:
-        return {}
-    source_dirs = {}
-    for name in COMPONENT_FETCHCONTENT_NAMES:
-        candidate = WORKSPACE_DIR / f"triton-{name}"
-        if candidate.exists():
-            source_dirs[name] = candidate.resolve()
-    return source_dirs
-
-
-def component_source_cmake_args(source_dirs):
-    args = []
-    for name in sorted(source_dirs):
-        path = source_dirs[name]
-        if not path.exists():
-            raise SystemExit(f"component source directory does not exist: {path}")
-        fetchcontent_name = COMPONENT_FETCHCONTENT_NAMES[name]
-        args.append(f"-DFETCHCONTENT_SOURCE_DIR_{fetchcontent_name}:PATH={path}")
-    return args
 
 
 def ensure_onnxruntime_backend(build_args):
@@ -213,7 +170,6 @@ def run_backend_builder_in_triton_build_container(
     plan_output,
     artifact_dir,
     backend_source_dir,
-    component_source_dirs,
     image,
 ):
     runargs = [
@@ -249,16 +205,17 @@ def run_backend_builder_in_triton_build_container(
                 os.path.expanduser(build.FLAGS.use_user_docker_config)
             ),
         ]
+    # WORKSPACE_DIR contains the local org mirror (passed as --github-organization),
+    # so mounting it makes the mirror available for the backend's nested component
+    # clones; no per-component mounts are needed.
     mount_paths = [WORKSPACE_DIR, artifact_dir, plan_output.parent, backend_source_dir]
-    mount_paths += list(component_source_dirs.values())
     runargs += docker_mount_args(mount_paths)
-    runargs += [
-        image,
-        "python3",
-        str(backend_script),
-        "--plan",
-        str(plan_output),
-    ]
+    # The mirror is owned by the host user but git runs as root in the container;
+    # mark it safe so FetchContent clones don't fail with "dubious ownership".
+    inner_cmd = "git config --system --add safe.directory '*' && python3 '{}' --plan '{}'".format(
+        backend_script, plan_output
+    )
+    runargs += [image, "sh", "-c", inner_cmd]
     subprocess.run([str(arg) for arg in runargs], check=True)
 
 
@@ -283,25 +240,6 @@ def main():
         type=pathlib.Path,
         default=None,
         help="Path to a triton-onnxruntime_backend checkout. Defaults to a sibling checkout.",
-    )
-    parser.add_argument(
-        "--component-source-dir",
-        action="append",
-        default=[],
-        metavar="NAME=PATH",
-        help=(
-            "Use a local source checkout for a backend dependency. NAME must be "
-            "common, core or backend. By default, sibling triton-common, "
-            "triton-core and triton-backend checkouts are used when present."
-        ),
-    )
-    parser.add_argument(
-        "--no-local-component-repos",
-        action="store_true",
-        help=(
-            "Do not automatically use sibling triton-common, triton-core and "
-            "triton-backend checkouts for backend CMake FetchContent."
-        ),
     )
     parser.add_argument(
         "--ort-docker-build-network",
@@ -362,13 +300,6 @@ def main():
         build.FLAGS.github_organization,
         backend_tag,
     )
-    component_source_dirs = default_component_source_dirs(
-        wrapper_args.no_local_component_repos
-    )
-    component_source_dirs.update(
-        parse_component_source_dirs(wrapper_args.component_source_dir)
-    )
-
     cmake_args = normalize_cmake_args(
         build.backend_cmake_args(
             build_config["images"],
@@ -378,7 +309,6 @@ def main():
             library_paths,
         )
     )
-    cmake_args += component_source_cmake_args(component_source_dirs)
 
     cuda_arch_list = build.FLAGS.cuda_arch_list
 
@@ -401,9 +331,6 @@ def main():
         "build_type": build.FLAGS.build_type,
         "cmake_args": cmake_args,
         "components": build_config["components"],
-        "component_source_dirs": {
-            name: str(path) for name, path in sorted(component_source_dirs.items())
-        },
         "build_environment": (
             "triton-build-container"
             if wrapper_args.build_in_triton_build_container
@@ -458,7 +385,6 @@ def main():
             plan_output.resolve(),
             artifact_dir,
             backend_source_dir,
-            component_source_dirs,
             wrapper_args.triton_buildbase_image,
         )
     else:
