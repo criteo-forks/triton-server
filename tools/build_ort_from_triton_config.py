@@ -220,6 +220,11 @@ def run_backend_builder_in_triton_build_container(
         "docker",
         "run",
         "--rm",
+        # Use the host network so CMake FetchContent (e.g. googletest pulled by
+        # triton-common tests) can resolve and reach github.com from inside the
+        # buildbase container; the rootless default bridge has no working DNS.
+        "--network",
+        "host",
         "-w",
         str(backend_source_dir),
     ]
