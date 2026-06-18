@@ -1841,7 +1841,19 @@ def create_docker_build_script(
                 runargs += ["--memory", FLAGS.container_memory]
             runargs += ["-v", "\\\\.\\pipe\\docker_engine:\\\\.\\pipe\\docker_engine"]
         else:
+            # Use the host network so in-container git clones and CMake
+            # FetchContent can resolve github.com; the rootless default bridge
+            # has no working DNS.
+            runargs += ["--network", "host"]
             runargs += docker_socket_runargs()
+            # If --github-organization is a local directory (a repo mirror), mount
+            # it too. The org propagates into every nested component configure
+            # (TRITON_REPO_ORGANIZATION), so pointing it at a local mirror is the
+            # only way to resolve deeply-nested clones (e.g. core -> common)
+            # offline; FETCHCONTENT_SOURCE_DIR overrides do not reach those builds.
+            if FLAGS.github_organization and os.path.isdir(FLAGS.github_organization):
+                org_abs = os.path.abspath(FLAGS.github_organization)
+                runargs += ["-v", f"{org_abs}:{org_abs}"]
             if FLAGS.use_user_docker_config:
                 if os.path.exists(FLAGS.use_user_docker_config):
                     runargs += [
