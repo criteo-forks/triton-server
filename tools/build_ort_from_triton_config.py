@@ -101,6 +101,30 @@ def config_hash(config):
     return hashlib.sha256(payload).hexdigest()[:12]
 
 
+def _ort_identity_cmake_args(cmake_args):
+    """Extract cmake args that affect the ORT binary identity.
+
+    Only cmake variables that reach gen_ort_dockerfile.py via
+    CMakeLists.txt:403/416 (either directly or through _GEN_FLAGS) are
+    included.  Triton-generic variables (STATS, METRICS, repo tags, etc.)
+    and environment-only variables (TRT_VERSION,
+    TRITON_ONNX_TENSORRT_REPO_TAG) are excluded so that non-ORT build
+    changes do not invalidate the ORT artifact cache.
+    """
+    ort_keys = {
+        "TRITON_BUILD_CONTAINER",
+        "TRITON_ENABLE_ONNXRUNTIME_OPENVINO",
+        "TRITON_ENABLE_ONNXRUNTIME_TENSORRT",
+    }
+    result = []
+    for arg in cmake_args:
+        if arg.startswith("-D"):
+            name = arg[2:].split(":")[0].split("=")[0]
+            if name in ort_keys:
+                result.append(arg)
+    return sorted(result)
+
+
 def write_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -352,18 +376,38 @@ def main():
         "upstream_container_version": build.FLAGS.upstream_container_version,
         "version": build.FLAGS.version,
     }
-    source_config["config_hash"] = config_hash(source_config)
+    ort_identity = {
+        "backend_tag": backend_tag,
+        "build_environment": (
+            "triton-build-container"
+            if wrapper_args.build_in_triton_build_container
+            else "host"
+        ),
+        "build_type": build.FLAGS.build_type,
+        "cuda_arch_list": cuda_arch_list,
+        "enable_gpu": build.FLAGS.enable_gpu,
+        "ort_cmake_args": _ort_identity_cmake_args(cmake_args),
+        "ort_openvino_version": build.FLAGS.ort_openvino_version,
+        "ort_version": build.FLAGS.ort_version,
+        "target_machine": build.target_machine(),
+        "target_platform": build.target_platform(),
+        "triton_buildbase_image": wrapper_args.triton_buildbase_image,
+        "triton_container_version": build.FLAGS.triton_container_version,
+    }
+    config_hash_value = config_hash(ort_identity)
+    source_config["config_hash"] = config_hash_value
 
     plan = {
         "artifact_dir": str(artifact_dir),
         "artifact_name": "onnxruntime-{}-{}-{}.tar.gz".format(
             build.FLAGS.ort_version,
             build.FLAGS.triton_container_version,
-            source_config["config_hash"],
+            config_hash_value,
         ),
         "backend_source_dir": str(backend_source_dir),
         "backend_git_commit": git_value(backend_source_dir, ["rev-parse", "HEAD"]),
         "server_git_commit": git_value(SERVER_DIR, ["rev-parse", "HEAD"]),
+        "ort_identity": ort_identity,
         "source_config": source_config,
     }
 
