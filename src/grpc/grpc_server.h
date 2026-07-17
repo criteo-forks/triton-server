@@ -96,8 +96,10 @@ struct Options {
   // The maximum number of inference request/response objects that
   // remain allocated for reuse. As long as the number of in-flight
   // requests doesn't exceed this value there will be no
-  // allocation/deallocation of request/response objects.
-  int infer_allocation_pool_size_{8};
+  // allocation/deallocation of request/response objects. Default is
+  // larger than before so that state/request reuse actually triggers
+  // at high in-flight request counts.
+  int infer_allocation_pool_size_{512};
   int max_response_pool_size_{INT_MAX};
   RestrictedFeatures restricted_protocols_;
   std::string forward_header_pattern_;

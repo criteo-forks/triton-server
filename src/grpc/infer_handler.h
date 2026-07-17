@@ -1195,7 +1195,28 @@ class InferHandlerState {
   void Release()
   {
     context_ = nullptr;
-    inference_request_.reset();
+    if (inference_request_ && (inference_request_.use_count() == 1)) {
+      // Sole owner: either the request was never submitted to the core, or
+      // the core release callback has already run, so the request is in
+      // RELEASED state and can be kept for reuse by the next RPC on this
+      // state. Clear its inputs/requested outputs now (on the handler
+      // thread) so it is ready for TRITONSERVER_InferenceRequestReset()
+      // next time.
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_InferenceRequestRemoveAllInputs(
+              inference_request_.get()),
+          "removing inference request inputs");
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_InferenceRequestRemoveAllRequestedOutputs(
+              inference_request_.get()),
+          "removing inference request requested outputs");
+    } else {
+      // A live RequestReleasePayload still references the request (the
+      // core release callback has not run yet, e.g. cancellation/error
+      // path, or simply hasn't been invoked before this point); deletion
+      // defers to it as before.
+      inference_request_.reset();
+    }
     ClearTraceTimestamps();
   }
 

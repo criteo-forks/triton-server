@@ -922,21 +922,37 @@ ModelInferHandler::Execute(InferHandler::State* state)
   }
 
   // Create the inference request which contains all the
-  // input information needed for an inference.
+  // input information needed for an inference. If this state already
+  // owns a released request for the same model/version, reset and reuse
+  // it instead of allocating a new one.
   TRITONSERVER_InferenceRequest* irequest = nullptr;
   if (err == nullptr) {
-    err = TRITONSERVER_InferenceRequestNew(
-        &irequest, tritonserver_.get(), request.model_name().c_str(),
-        requested_model_version);
+    if (state->inference_request_ &&
+        (state->inference_request_.use_count() == 1)) {
+      // Sole owner: reset and reuse the request kept by State::Release().
+      // Reset re-resolves the model exactly like New, so a model switch,
+      // reload or unload since the previous RPC is honored.
+      irequest = state->inference_request_.get();
+      err = TRITONSERVER_InferenceRequestReset(
+          irequest, tritonserver_.get(), request.model_name().c_str(),
+          requested_model_version);
+    } else {
+      state->inference_request_.reset();
+      err = TRITONSERVER_InferenceRequestNew(
+          &irequest, tritonserver_.get(), request.model_name().c_str(),
+          requested_model_version);
+      if (err == nullptr) {
+        state->inference_request_ = {
+            irequest, [](TRITONSERVER_InferenceRequest* request) {
+              LOG_TRITONSERVER_ERROR(
+                  TRITONSERVER_InferenceRequestDelete(request),
+                  "deleting gRPC inference request");
+            }};
+      }
+    }
   }
 
   if (err == nullptr) {
-    state->inference_request_ = {
-        irequest, [](TRITONSERVER_InferenceRequest* request) {
-          LOG_TRITONSERVER_ERROR(
-              TRITONSERVER_InferenceRequestDelete(request),
-              "deleting gRPC inference request");
-        }};
     err = SetInferenceRequestMetadata(irequest, request, state->parameters_);
   }
 
