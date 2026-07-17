@@ -1,4 +1,4 @@
-// Copyright 2019-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -39,6 +39,7 @@
 #include "grpc_utils.h"
 #include "health.grpc.pb.h"
 #include "infer_handler.h"
+#include "response_send_pool.h"
 #include "stream_infer_handler.h"
 #include "triton/core/tritonserver.h"
 
@@ -100,6 +101,10 @@ struct Options {
   int max_response_pool_size_{INT_MAX};
   RestrictedFeatures restricted_protocols_;
   std::string forward_header_pattern_;
+  // Number of dedicated threads used to complete and send unary gRPC
+  // inference responses off the backend runner threads. 0 = send inline
+  // on the calling thread. Per-request response ordering is preserved.
+  int response_send_thread_count_{0};
 };
 
 class Server {
@@ -164,6 +169,10 @@ class Server {
   std::unique_ptr<HandlerBase> common_handler_;
   std::vector<std::unique_ptr<HandlerBase>> model_infer_handlers_;
   std::vector<std::unique_ptr<HandlerBase>> model_stream_infer_handlers_;
+
+  // Sharded pool used to offload unary response completion+send off the
+  // backend runner threads. Null when response_send_thread_count_ is 0.
+  std::unique_ptr<ResponseSendPool> response_send_pool_;
 
   int bound_port_{0};
   bool running_{false};

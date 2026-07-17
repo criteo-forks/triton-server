@@ -81,6 +81,7 @@ class KServeGrpc:
         ] = Grpc_compression_level.NONE
         infer_thread_count: int = Field(2, ge=0)
         infer_cq_count: int = Field(1, ge=0, le=128)
+        response_send_thread_count: int = Field(0, ge=0, le=128)
         infer_allocation_pool_size: int = Field(8, ge=0)
         max_response_pool_size: int = Field(2_147_483_647, ge=0)
         forward_header_pattern: str = ""

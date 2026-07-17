@@ -308,6 +308,7 @@ enum TritonOptionId {
   OPTION_GRPC_HEADER_FORWARD_PATTERN,
   OPTION_GRPC_INFER_THREAD_COUNT,
   OPTION_GRPC_INFER_CQ_COUNT,
+  OPTION_GRPC_RESPONSE_SEND_THREAD_COUNT,
   OPTION_GRPC_INFER_ALLOCATION_POOL_SIZE,
   OPTION_GRPC_MAX_RESPONSE_POOL_SIZE,
   OPTION_GRPC_USE_SSL,
@@ -547,6 +548,13 @@ TritonParser::SetupOptions()
       {OPTION_GRPC_INFER_CQ_COUNT, "grpc-infer-cq-count", Option::ArgInt,
        "The number of gRPC inference completion queues. Default is 0 "
        "(one CQ per handler thread). Use 1 for legacy single-CQ behavior."});
+  grpc_options_.push_back(
+      {OPTION_GRPC_RESPONSE_SEND_THREAD_COUNT,
+       "grpc-response-send-thread-count", Option::ArgInt,
+       "Number of dedicated threads used to complete and send unary gRPC "
+       "inference responses off the backend runner threads. Default is 0 "
+       "(send inline on the calling thread). Per-request response ordering "
+       "is preserved."});
   grpc_options_.push_back(
       {OPTION_GRPC_INFER_ALLOCATION_POOL_SIZE,
        "grpc-infer-allocation-pool-size", Option::ArgInt,
@@ -1491,6 +1499,15 @@ TritonParser::Parse(int argc, char** argv)
             throw ParseException(
                 "invalid argument for --grpc_infer_cq_count. Must be in "
                 "the range 0 to 128.");
+          }
+          break;
+        case OPTION_GRPC_RESPONSE_SEND_THREAD_COUNT:
+          lgrpc_options.response_send_thread_count_ = ParseOption<int>(optarg);
+          if (lgrpc_options.response_send_thread_count_ < 0 ||
+              lgrpc_options.response_send_thread_count_ > 128) {
+            throw ParseException(
+                "invalid argument for --grpc_response_send_thread_count. "
+                "Must be in the range 0 to 128.");
           }
           break;
         case OPTION_GRPC_INFER_ALLOCATION_POOL_SIZE:

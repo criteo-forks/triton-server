@@ -669,6 +669,7 @@ ModelInferHandler::StartNewRequest()
   auto context = std::make_shared<State::Context>(cq_);
   context->SetCompressionLevel(compression_level_);
   State* state = StateNew(tritonserver_.get(), context);
+  state->response_send_pool_ = response_send_pool_;
 
 #ifdef TRITON_ENABLE_TRACING
   // Can't create trace as we don't know the model to be requested,
@@ -1049,6 +1050,22 @@ ModelInferHandler::Execute(InferHandler::State* state)
 
 void
 ModelInferHandler::InferResponseComplete(
+    TRITONSERVER_InferenceResponse* iresponse, const uint32_t flags,
+    void* userp)
+{
+  ResponseSendPool* pool =
+      static_cast<ResponseReleasePayload*>(userp)->state_->response_send_pool_;
+  if (pool == nullptr) {
+    InferResponseCompleteImpl(iresponse, flags, userp);
+    return;
+  }
+  pool->Enqueue(userp, [iresponse, flags, userp] {
+    InferResponseCompleteImpl(iresponse, flags, userp);
+  });
+}
+
+void
+ModelInferHandler::InferResponseCompleteImpl(
     TRITONSERVER_InferenceResponse* iresponse, const uint32_t flags,
     void* userp)
 {

@@ -39,6 +39,7 @@
 #include "grpc_handler.h"
 #include "grpc_service.grpc.pb.h"
 #include "grpc_utils.h"
+#include "response_send_pool.h"
 #include "triton/common/logging.h"
 #include "triton/core/tritonserver.h"
 
@@ -1262,6 +1263,11 @@ class InferHandlerState {
   int delay_enqueue_ms_;
   int delay_response_completion_ms_;
 
+  // When non-null, response completion+send is offloaded to this pool
+  // instead of running inline on the backend runner thread. Set by the
+  // handler that owns this state; nullptr means inline (default).
+  ResponseSendPool* response_send_pool_{nullptr};
+
   // For inference requests the allocator payload, unused for other
   // requests.
   AllocPayload<ResponseType> alloc_payload_;
@@ -1646,13 +1652,15 @@ class ModelInferHandler
       size_t max_response_queue_size, grpc_compression_level compression_level,
       std::pair<std::string, std::string> restricted_kv,
       const std::string& forward_header_pattern, std::shared_mutex* conn_mtx,
-      std::atomic<uint32_t>* conn_cnt, bool* accepting_new_conn)
+      std::atomic<uint32_t>* conn_cnt, bool* accepting_new_conn,
+      ResponseSendPool* response_send_pool)
       : InferHandler(
             name, tritonserver, service, cq, max_state_bucket_count,
             max_response_queue_size, restricted_kv, forward_header_pattern,
             conn_mtx, conn_cnt, accepting_new_conn),
         trace_manager_(trace_manager), shm_manager_(shm_manager),
-        compression_level_(compression_level)
+        compression_level_(compression_level),
+        response_send_pool_(response_send_pool)
   {
     // Create the allocator that will be used to allocate buffers for
     // the result tensors.
@@ -1687,12 +1695,16 @@ class ModelInferHandler
   static void InferResponseComplete(
       TRITONSERVER_InferenceResponse* response, const uint32_t flags,
       void* userp);
+  static void InferResponseCompleteImpl(
+      TRITONSERVER_InferenceResponse* response, const uint32_t flags,
+      void* userp);
 
   TraceManager* trace_manager_;
   std::shared_ptr<SharedMemoryManager> shm_manager_;
   TRITONSERVER_ResponseAllocator* allocator_;
 
   grpc_compression_level compression_level_;
+  ResponseSendPool* response_send_pool_;
 };
 
 #if !defined(_WIN32) && defined(TRITON_ENABLE_TRACING)

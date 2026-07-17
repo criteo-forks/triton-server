@@ -2387,9 +2387,10 @@ Server::Server(
 
   common_cq_ = builder_.AddCompletionQueue();
 
-  int cq_count = (options.infer_cq_count_ > 0)
-      ? std::min(options.infer_cq_count_, options.infer_thread_count_)
-      : options.infer_thread_count_;
+  int cq_count =
+      (options.infer_cq_count_ > 0)
+          ? std::min(options.infer_cq_count_, options.infer_thread_count_)
+          : options.infer_thread_count_;
   for (int i = 0; i < cq_count; ++i) {
     model_infer_cqs_.emplace_back(builder_.AddCompletionQueue());
   }
@@ -2408,6 +2409,11 @@ Server::Server(
       &health_service_, common_cq_.get(), options.restricted_protocols_,
       response_delay));
 
+  if (options.response_send_thread_count_ > 0) {
+    response_send_pool_.reset(
+        new ResponseSendPool(options.response_send_thread_count_));
+  }
+
   // [FIXME] "register" logic is different for infer
   // Handler for model inference requests.
   std::pair<std::string, std::string> restricted_kv =
@@ -2419,7 +2425,7 @@ Server::Server(
         options.infer_allocation_pool_size_ /* max_state_bucket_count */,
         options.max_response_pool_size_, options.infer_compression_level_,
         restricted_kv, options.forward_header_pattern_, &conn_mtx_, &conn_cnt_,
-        &accepting_new_conn_));
+        &accepting_new_conn_, response_send_pool_.get()));
   }
 
   // Handler for streaming inference requests. Keeps one handler for streaming
@@ -2495,8 +2501,11 @@ Server::GetOptions(Options& options, UnorderedMapType& options_map)
 
   RETURN_IF_ERR(GetValue(
       options_map, "infer_thread_count", &options.infer_thread_count_));
+  RETURN_IF_ERR(
+      GetValue(options_map, "infer_cq_count", &options.infer_cq_count_));
   RETURN_IF_ERR(GetValue(
-      options_map, "infer_cq_count", &options.infer_cq_count_));
+      options_map, "response_send_thread_count",
+      &options.response_send_thread_count_));
   RETURN_IF_ERR(GetValue(
       options_map, "infer_allocation_pool_size",
       &options.infer_allocation_pool_size_));
@@ -2627,6 +2636,11 @@ Server::Stop()
 
   if (graceful_shutdown_thread_.joinable()) {
     graceful_shutdown_thread_.join();
+  }
+
+  // All deferred Finish tags must land before completion queue shutdown.
+  if (response_send_pool_ != nullptr) {
+    response_send_pool_->Drain();
   }
 
   // Shutdown completion queues

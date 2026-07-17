@@ -78,6 +78,47 @@ if(${TRITON_ENABLE_HTTP} OR ${TRITON_ENABLE_METRICS} OR
 endif()
 
 #
+# Unit test for ResponseSendPool (sharded thread pool used to offload gRPC
+# unary response completion+send off the backend runner thread).
+#
+if(TARGET triton-common-thread-pool)
+  add_executable(
+    response_send_pool_test
+    response_send_pool_test.cc
+    ../grpc/response_send_pool.h
+  )
+
+  set_target_properties(
+    response_send_pool_test
+    PROPERTIES
+      SKIP_BUILD_RPATH TRUE
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH_USE_LINK_PATH FALSE
+      INSTALL_RPATH ""
+  )
+
+  target_include_directories(
+    response_send_pool_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/..
+      ${GTEST_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(
+    response_send_pool_test
+    PRIVATE
+      triton-common-thread-pool  # from repo-common
+      GTest::gtest
+      GTest::gtest_main
+  )
+
+  install(
+    TARGETS response_send_pool_test
+    RUNTIME DESTINATION bin
+  )
+endif()
+
+#
 # Unit test for Backend + Common + Core tensor size APIs (GetElementCount,
 # GetByteSize). Core template headers are used directly; the few core symbols
 # not available via libtritonserver.so (hidden by linker script) are defined
