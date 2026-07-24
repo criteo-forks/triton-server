@@ -37,6 +37,24 @@ NextUniqueId()
 
 namespace triton { namespace server { namespace grpc {
 
+namespace {
+
+// TRITON_GRPC_RESPONSE_OFFLOAD=1 moves the unary inference response send
+// (responder_->Finish: protobuf serialization + HTTP/2 framing + TCP send)
+// off the model-instance thread that runs InferResponseComplete and onto
+// the completion-queue handler threads, via an alarm handoff.
+bool
+ResponseOffloadEnabled()
+{
+  static const bool enabled = [] {
+    const char* str = getenv("TRITON_GRPC_RESPONSE_OFFLOAD");
+    return (str != nullptr) && (str[0] == '1');
+  }();
+  return enabled;
+}
+
+}  // namespace
+
 TRITONSERVER_Error*
 OutputBufferAttributesHelper(
     TRITONSERVER_ResponseAllocator* allocator, const char* tensor_name,
@@ -742,6 +760,13 @@ ModelInferHandler::Process(
         state->step_ == Steps::COMPLETE || state->step_ == Steps::FINISH) {
       // If the request is completed, simply ignore the cancellation.
       skip_handle_cancellation = true;
+    } else if (!is_notification && (state->step_ == Steps::WRITEREADY)) {
+      // Offloaded-response alarm event (TRITON_GRPC_RESPONSE_OFFLOAD):
+      // the WRITEREADY branch below decides between sending and
+      // releasing, under step_mtx_. Routing it through
+      // HandleCancellation could consume the event without releasing
+      // the state when it races the cancellation notification.
+      skip_handle_cancellation = true;
     }
 
     if (!skip_handle_cancellation) {
@@ -811,6 +836,50 @@ ModelInferHandler::Process(
           inference::ModelInferResponse(), status, state);
     }
 
+  } else if (state->step_ == Steps::WRITEREADY) {
+    // Offloaded response send (TRITON_GRPC_RESPONSE_OFFLOAD=1): the
+    // response callback filled the protobuf on the model-instance
+    // thread and handed the state here via PutTaskBackToQueue. The
+    // response object is owned by state->response_queue_ and is only
+    // cleared when the state is released, so it is still valid here.
+    //
+    // IsGrpcContextCancelled() acquires context mu_, and
+    // IssueRequestCancellation acquires mu_ then step_mtx_; sample the
+    // cancellation BEFORE taking step_mtx_ to avoid adding a
+    // lock-order inversion.
+    const bool cancelled = state->IsGrpcContextCancelled();
+    bool requeue_cancelled = false;
+    {
+      std::lock_guard<std::recursive_mutex> lock(state->step_mtx_);
+      state->response_offload_pending_ = false;
+      if (!rpc_ok) {
+        // The completion queue is shutting down; the RPC can no longer
+        // be finished. Release the state.
+        state->step_ = Steps::FINISH;
+        finished = true;
+      } else if (cancelled) {
+        // Mirror the cancellation flow of InferResponseComplete: mark
+        // the state CANCELLED and put it back on the queue; the next
+        // cycle runs HandleCancellation, which releases it.
+        state->step_ = Steps::CANCELLED;
+        requeue_cancelled = true;
+      } else {
+#ifdef TRITON_ENABLE_TRACING
+        state->trace_timestamps_.emplace_back(std::make_pair(
+            "GRPC_SEND_START", TraceManager::CaptureTimestamp()));
+#endif  // TRITON_ENABLE_TRACING
+        // step_ must become COMPLETE before Finish() is issued: the
+        // Finish completion tag may be processed by another handler
+        // thread immediately.
+        state->step_ = Steps::COMPLETE;
+        state->context_->responder_->Finish(
+            *state->response_queue_->GetResponseAt(0), state->status_, state);
+      }
+    }
+    if (requeue_cancelled) {
+      // Outside step_mtx_: PutTaskBackToQueue acquires context mu_.
+      state->context_->PutTaskBackToQueue(state);
+    }
   } else if (state->step_ == Steps::COMPLETE) {
 #ifdef TRITON_ENABLE_TRACING
     state->trace_timestamps_.emplace_back(
@@ -1173,11 +1242,6 @@ ModelInferHandler::InferResponseComplete(
   }
 
 
-#ifdef TRITON_ENABLE_TRACING
-  state->trace_timestamps_.emplace_back(
-      std::make_pair("GRPC_SEND_START", TraceManager::CaptureTimestamp()));
-#endif  // TRITON_ENABLE_TRACING
-
   if (state->delay_response_completion_ms_ != 0) {
     // Will delay the Process execution of state at step COMPLETE by the
     // specified time. This can be used to test the flow when cancellation
@@ -1188,10 +1252,27 @@ ModelInferHandler::InferResponseComplete(
         std::chrono::milliseconds(state->delay_response_completion_ms_));
   }
 
-  state->step_ = Steps::COMPLETE;
-  state->context_->responder_->Finish(*response, state->status_, state);
-  if (response_created) {
-    delete response;
+  if (ResponseOffloadEnabled() && !response_created) {
+    // Hand the filled response to the completion queue so that a CQ
+    // handler thread performs the serialization + network send
+    // (responder_->Finish) instead of this model-instance thread.
+    // GRPC_SEND_START is recorded when Finish is actually issued, in
+    // ModelInferHandler::Process. 'response' stays valid across the
+    // handoff: it is owned by state->response_queue_, which is only
+    // cleared when the state is released.
+    state->response_offload_pending_ = true;
+    state->step_ = Steps::WRITEREADY;
+    state->context_->PutTaskBackToQueue(state);
+  } else {
+#ifdef TRITON_ENABLE_TRACING
+    state->trace_timestamps_.emplace_back(
+        std::make_pair("GRPC_SEND_START", TraceManager::CaptureTimestamp()));
+#endif  // TRITON_ENABLE_TRACING
+    state->step_ = Steps::COMPLETE;
+    state->context_->responder_->Finish(*response, state->status_, state);
+    if (response_created) {
+      delete response;
+    }
   }
 
   delete response_release_payload;

@@ -859,6 +859,14 @@ class InferHandlerState {
         // Issues the request cancellation to the core.
         for (auto state : inflight_states_) {
           std::lock_guard<std::recursive_mutex> lock(state->step_mtx_);
+          if (state->response_offload_pending_) {
+            // The response was already produced and handed to the
+            // completion queue (TRITON_GRPC_RESPONSE_OFFLOAD). The
+            // pending WRITEREADY alarm event will observe the cancelled
+            // context and release the state. Do not touch step_ and do
+            // not re-set the alarm: it is already armed.
+            continue;
+          }
           if (state->step_ != Steps::CANCELLED &&
               state->step_ != Steps::COMPLETE) {
             LOG_VERBOSE(1) << "Issuing cancellation for " << state->unique_id_
@@ -1179,6 +1187,7 @@ class InferHandlerState {
     cb_count_ = 0;
     is_decoupled_ = false;
     complete_ = false;
+    response_offload_pending_ = false;
     parameters_ = {};
     request_.Clear();
     response_queue_->Reset();
@@ -1246,6 +1255,10 @@ class InferHandlerState {
   ::grpc::Status status_;
   std::atomic<uint32_t> cb_count_;
   bool complete_;
+  // True while a filled unary response has been handed to the completion
+  // queue (step_ == WRITEREADY, alarm event in flight) for the send to be
+  // performed on a CQ handler thread (TRITON_GRPC_RESPONSE_OFFLOAD=1).
+  bool response_offload_pending_ = false;
 
   RequestType request_;
   std::shared_ptr<ResponseQueue<ResponseType>> response_queue_;
