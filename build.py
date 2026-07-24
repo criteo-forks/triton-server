@@ -618,6 +618,18 @@ def onnxruntime_cmake_args(images, library_paths):
             else FLAGS.ort_version,
         )
     ]
+    if FLAGS.build_parallel_was_explicit:
+        cargs.append(
+            cmake_backend_arg(
+                "onnxruntime", "TRITON_BUILD_PARALLEL", None, FLAGS.build_parallel
+            )
+        )
+    if FLAGS.cuda_arch_list is not None:
+        cargs.append(
+            cmake_backend_arg(
+                "onnxruntime", "TRITON_CUDA_ARCH_LIST", "STRING", FLAGS.cuda_arch_list
+            )
+        )
 
     # TRITON_ENABLE_GPU is already set for all backends in backend_cmake_args()
     if FLAGS.enable_gpu:
@@ -1669,15 +1681,20 @@ def create_docker_build_script(script_name, container_install_dir, container_ci_
         if not FLAGS.no_container_interactive:
             runargs += ["-it"]
 
-        runargs += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
-        if FLAGS.use_user_docker_config:
-            if os.path.exists(FLAGS.use_user_docker_config):
-                runargs += [
-                    "-v",
-                    os.path.expanduser(
-                        FLAGS.use_user_docker_config + ":/root/.docker/config.json"
-                    ),
-                ]
+        if target_platform() == "windows":
+            if FLAGS.container_memory:
+                runargs += ["--memory", FLAGS.container_memory]
+            runargs += ["-v", "\\\\.\\pipe\\docker_engine:\\\\.\\pipe\\docker_engine"]
+        else:
+            runargs += docker_socket_runargs()
+            if FLAGS.use_user_docker_config:
+                if os.path.exists(FLAGS.use_user_docker_config):
+                    runargs += [
+                        "-v",
+                        os.path.expanduser(
+                            FLAGS.use_user_docker_config + ":/root/.docker/config.json"
+                        ),
+                    ]
 
         # TRI-1118 — propagate TRITON_RELEASE_VERSION into the wheel build
         # only when it was actually set in main() (release-semantic version
@@ -2166,6 +2183,18 @@ def finalize_build(cmake_script, install_dir, ci_dir):
     cmake_script.cmd(f"chmod -R u+rwX,go+rX,go-w {ci_dir}")
 
 
+def docker_socket_runargs():
+    docker_host = os.getenv("DOCKER_HOST")
+    if docker_host is None:
+        return ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+
+    runargs = ["-e", f"DOCKER_HOST={docker_host}"]
+    if docker_host.startswith("unix://"):
+        socket_path = docker_host[len("unix://") :]
+        runargs += ["-v", f"{socket_path}:{socket_path}"]
+    return runargs
+
+
 def enable_all():
     all_backends = [
         "ensemble",
@@ -2439,6 +2468,16 @@ if __name__ == "__main__":
         default="6.0",
         help="Minimum CUDA compute capability supported by server.",
     )
+    parser.add_argument(
+        "--cuda-arch-list",
+        type=str,
+        required=False,
+        default=os.getenv("CUDA_ARCH_LIST"),
+        help=(
+            "CUDA architectures to pass to nested ONNX Runtime builds. "
+            "Defaults to CUDA_ARCH_LIST from the environment when set."
+        ),
+    )
 
     parser.add_argument(
         "--endpoint",
@@ -2665,6 +2704,7 @@ if __name__ == "__main__":
     elif re.match(r"^\d+\.\d+\.\d+$", FLAGS.version):
         os.environ.setdefault("TRITON_RELEASE_VERSION", FLAGS.version)
 
+    FLAGS.build_parallel_was_explicit = FLAGS.build_parallel is not None
     if FLAGS.build_parallel is None:
         FLAGS.build_parallel = multiprocessing.cpu_count() * 2
 
