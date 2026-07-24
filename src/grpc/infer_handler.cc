@@ -37,6 +37,30 @@ NextUniqueId()
 
 namespace triton { namespace server { namespace grpc {
 
+namespace {
+
+// TRITON_GRPC_RESPONSE_OFFLOAD moves per-response work off the
+// model-instance thread (which runs InferResponseComplete) and onto the
+// completion-queue handler threads, via an alarm handoff:
+//   =1  the send only: responder_->Finish (protobuf serialization +
+//       HTTP/2 framing + TCP send).
+//   =2  additionally ALL protobuf work: the response allocator hands the
+//       backend scratch buffers instead of protobuf-internal memory, and
+//       the response object creation, output population, metadata fill
+//       (InferResponseCompleteCommon), status creation and core-response
+//       deletion also run on the handler thread.
+int
+ResponseOffloadLevel()
+{
+  static const int level = [] {
+    const char* str = getenv("TRITON_GRPC_RESPONSE_OFFLOAD");
+    return (str != nullptr) ? atoi(str) : 0;
+  }();
+  return level;
+}
+
+}  // namespace
+
 TRITONSERVER_Error*
 OutputBufferAttributesHelper(
     TRITONSERVER_ResponseAllocator* allocator, const char* tensor_name,
@@ -91,6 +115,81 @@ OutputBufferQueryHelper(
   return nullptr;  // Success
 }
 
+// TRITON_GRPC_RESPONSE_OFFLOAD=2: allocation counterpart of
+// ResponseAllocatorHelper that performs no protobuf work on the calling
+// (model-instance) thread. Records the output and returns either the
+// client's shared-memory region or a per-state reusable scratch buffer.
+// Keep the shared-memory and CPU-fallback logic in sync with
+// ResponseAllocatorHelper.
+TRITONSERVER_Error*
+DeferredResponseAlloc(
+    AllocPayload<inference::ModelInferResponse>* payload,
+    const char* tensor_name, size_t byte_size,
+    TRITONSERVER_MemoryType preferred_memory_type,
+    int64_t preferred_memory_type_id, void** buffer, void** buffer_userp,
+    TRITONSERVER_MemoryType* actual_memory_type,
+    int64_t* actual_memory_type_id)
+{
+  *buffer = nullptr;
+  *buffer_userp = nullptr;
+  *actual_memory_type = preferred_memory_type;
+  *actual_memory_type_id = preferred_memory_type_id;
+
+  DeferredResponseOutputs* deferred = payload->deferred_;
+  DeferredResponseOutputs::Output* record = deferred->AllocateOutput();
+  record->name.assign(tensor_name);
+  record->byte_size = byte_size;
+  record->in_shm = false;
+  record->scratch_index = 0;
+
+  if (byte_size > 0) {
+    const auto& pr = payload->shm_map_.find(tensor_name);
+    if (pr != payload->shm_map_.end()) {
+      // The output is in shared memory so check that shared memory
+      // size is at least large enough for the output.
+      if (byte_size > pr->second.byte_size_) {
+        return TRITONSERVER_ErrorNew(
+            TRITONSERVER_ERROR_INTERNAL,
+            std::string(
+                "shared memory size specified with the request for output '" +
+                std::string(tensor_name) + "' (" +
+                std::to_string(pr->second.byte_size_) +
+                " bytes) should be at least " + std::to_string(byte_size) +
+                " bytes to hold the results")
+                .c_str());
+      }
+
+      record->in_shm = true;
+      *buffer = const_cast<void*>(pr->second.base_);
+      *actual_memory_type = pr->second.memory_type_;
+      *actual_memory_type_id = pr->second.memory_type_id_;
+
+      LOG_VERBOSE(1) << "GRPC: using shared-memory for '" << tensor_name
+                     << "', size: " << byte_size << ", addr: " << *buffer;
+      return nullptr;  // Success
+    }
+
+    // Scratch buffers are CPU memory.
+    if (*actual_memory_type != TRITONSERVER_MEMORY_CPU) {
+      LOG_VERBOSE(1) << "GRPC: unable to provide '" << tensor_name << "' in "
+                     << TRITONSERVER_MemoryTypeString(*actual_memory_type)
+                     << ", will use "
+                     << TRITONSERVER_MemoryTypeString(TRITONSERVER_MEMORY_CPU);
+      *actual_memory_type = TRITONSERVER_MEMORY_CPU;
+      *actual_memory_type_id = 0;
+    }
+
+    record->scratch_index = deferred->scratch_used_;
+    std::string* scratch = deferred->AllocateScratch(byte_size);
+    *buffer = static_cast<void*>(&((*scratch)[0]));
+
+    LOG_VERBOSE(1) << "GRPC: using deferred scratch buffer for '" << tensor_name
+                   << "', size: " << byte_size << ", addr: " << *buffer;
+  }
+
+  return nullptr;  // Success
+}
+
 // Make sure to keep InferResponseAlloc and OutputBufferQuery logic in sync
 TRITONSERVER_Error*
 InferResponseAlloc(
@@ -102,6 +201,16 @@ InferResponseAlloc(
 {
   AllocPayload<inference::ModelInferResponse>* payload =
       reinterpret_cast<AllocPayload<inference::ModelInferResponse>*>(userp);
+
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2: no protobuf work on this
+  // (model-instance) thread; record the output and hand out a scratch
+  // buffer. The protobuf is built on the CQ handler thread at send time.
+  if (payload->deferred_ != nullptr) {
+    return DeferredResponseAlloc(
+        payload, tensor_name, byte_size, preferred_memory_type,
+        preferred_memory_type_id, buffer, buffer_userp, actual_memory_type,
+        actual_memory_type_id);
+  }
 
   // ModelInfer RPC expects exactly one response per request. Hence,
   // will be creating and using just one response object.
@@ -193,6 +302,12 @@ InferResponseStart(TRITONSERVER_ResponseAllocator* allocator, void* userp)
 {
   AllocPayload<inference::ModelInferResponse>* payload =
       reinterpret_cast<AllocPayload<inference::ModelInferResponse>*>(userp);
+
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2: the response object is created on the
+  // CQ handler thread at send time; nothing to do here.
+  if (payload->deferred_ != nullptr) {
+    return nullptr;  // success
+  }
 
   // ModelInfer RPC expects exactly one response per request. Hence, always call
   // GetNonDecoupledResponse() to create one response object on response start.
@@ -742,6 +857,13 @@ ModelInferHandler::Process(
         state->step_ == Steps::COMPLETE || state->step_ == Steps::FINISH) {
       // If the request is completed, simply ignore the cancellation.
       skip_handle_cancellation = true;
+    } else if (!is_notification && (state->step_ == Steps::WRITEREADY)) {
+      // Offloaded-response alarm event (TRITON_GRPC_RESPONSE_OFFLOAD):
+      // the WRITEREADY branch below decides between sending and
+      // releasing, under step_mtx_. Routing it through
+      // HandleCancellation could consume the event without releasing
+      // the state when it races the cancellation notification.
+      skip_handle_cancellation = true;
     }
 
     if (!skip_handle_cancellation) {
@@ -811,6 +933,68 @@ ModelInferHandler::Process(
           inference::ModelInferResponse(), status, state);
     }
 
+  } else if (state->step_ == Steps::WRITEREADY) {
+    // Offloaded response (TRITON_GRPC_RESPONSE_OFFLOAD): the response
+    // callback handed the state here via PutTaskBackToQueue. At level 1
+    // the protobuf is already filled; at level 2 it is built here, on
+    // this handler thread, from the deferred output records.
+    //
+    // IsGrpcContextCancelled() acquires context mu_, and
+    // IssueRequestCancellation acquires mu_ then step_mtx_; sample the
+    // cancellation BEFORE taking step_mtx_ to avoid adding a
+    // lock-order inversion.
+    const bool cancelled = state->IsGrpcContextCancelled();
+    bool requeue_cancelled = false;
+    {
+      std::lock_guard<std::recursive_mutex> lock(state->step_mtx_);
+      state->response_offload_pending_ = false;
+      TRITONSERVER_InferenceResponse* iresponse = state->deferred_iresponse_;
+      state->deferred_iresponse_ = nullptr;
+      if (!rpc_ok) {
+        // The completion queue is shutting down; the RPC can no longer
+        // be finished. Release the state.
+        if (iresponse != nullptr) {
+          LOG_TRITONSERVER_ERROR(
+              TRITONSERVER_InferenceResponseDelete(iresponse),
+              "deleting deferred GRPC inference response");
+        }
+        state->step_ = Steps::FINISH;
+        finished = true;
+      } else if (cancelled) {
+        // Mirror the cancellation flow of InferResponseComplete: mark
+        // the state CANCELLED and put it back on the queue; the next
+        // cycle runs HandleCancellation, which releases it.
+        if (iresponse != nullptr) {
+          LOG_TRITONSERVER_ERROR(
+              TRITONSERVER_InferenceResponseDelete(iresponse),
+              "deleting deferred GRPC inference response");
+        }
+        state->step_ = Steps::CANCELLED;
+        requeue_cancelled = true;
+      } else {
+        inference::ModelInferResponse* response;
+        if (ResponseOffloadLevel() >= 2) {
+          // Builds the protobuf, fills it from 'iresponse', sets
+          // state->status_ and deletes 'iresponse'.
+          response = BuildDeferredResponse(state, iresponse);
+        } else {
+          response = state->response_queue_->GetResponseAt(0);
+        }
+#ifdef TRITON_ENABLE_TRACING
+        state->trace_timestamps_.emplace_back(std::make_pair(
+            "GRPC_SEND_START", TraceManager::CaptureTimestamp()));
+#endif  // TRITON_ENABLE_TRACING
+        // step_ must become COMPLETE before Finish() is issued: the
+        // Finish completion tag may be processed by another handler
+        // thread immediately.
+        state->step_ = Steps::COMPLETE;
+        state->context_->responder_->Finish(*response, state->status_, state);
+      }
+    }
+    if (requeue_cancelled) {
+      // Outside step_mtx_: PutTaskBackToQueue acquires context mu_.
+      state->context_->PutTaskBackToQueue(state);
+    }
   } else if (state->step_ == Steps::COMPLETE) {
 #ifdef TRITON_ENABLE_TRACING
     state->trace_timestamps_.emplace_back(
@@ -967,6 +1151,12 @@ ModelInferHandler::Execute(InferHandler::State* state)
         tritonserver_, shm_manager_, request, std::move(serialized_data),
         response_queue, &state->alloc_payload_, &shm_regions_info);
   }
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2: response allocation must not touch
+  // the protobuf on the model-instance thread; point the allocator at
+  // this state's deferred-output records instead.
+  state->deferred_outputs_.Reset();
+  state->alloc_payload_.deferred_ =
+      (ResponseOffloadLevel() >= 2) ? &state->deferred_outputs_ : nullptr;
 
   auto request_release_payload =
       std::make_unique<RequestReleasePayload>(state->inference_request_);
@@ -1047,6 +1237,65 @@ ModelInferHandler::Execute(InferHandler::State* state)
   }
 }
 
+inference::ModelInferResponse*
+ModelInferHandler::BuildDeferredResponse(
+    State* state, TRITONSERVER_InferenceResponse* iresponse)
+{
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2, runs on a CQ handler thread under
+  // state->step_mtx_. Performs the protobuf work that
+  // InferResponseStart, ResponseAllocatorHelper and
+  // InferResponseComplete would have done on the model-instance thread.
+  inference::ModelInferResponse* response =
+      state->response_queue_->GetNonDecoupledResponse();
+
+  // Replay the recorded outputs: what ResponseAllocatorHelper would have
+  // added at allocation time. Order matches allocation order, which is
+  // what InferResponseCompleteCommon expects.
+  auto& deferred = state->deferred_outputs_;
+  for (size_t i = 0; i < deferred.outputs_used_; ++i) {
+    const auto& record = deferred.outputs_[i];
+    inference::ModelInferResponse::InferOutputTensor* output_tensor =
+        response->add_outputs();
+    output_tensor->set_name(record.name);
+    std::string* raw_output = response->add_raw_output_contents();
+    if (!record.in_shm && (record.byte_size > 0)) {
+      raw_output->assign(
+          deferred.scratch_[record.scratch_index].data(), record.byte_size);
+    }
+  }
+
+  TRITONSERVER_Error* err = nullptr;
+  if (state->cb_count_ != 1) {
+    err = TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL, std::string(
+                                         "expected a single response, got " +
+                                         std::to_string(state->cb_count_))
+                                         .c_str());
+  } else if (iresponse != nullptr) {
+    err = InferResponseCompleteCommon<inference::ModelInferResponse>(
+        state->tritonserver_, iresponse, *response, state->alloc_payload_);
+#ifdef TRITON_ENABLE_TRACING
+    state->trace_timestamps_.emplace_back(std::make_pair(
+        "INFER_RESPONSE_COMPLETE", TraceManager::CaptureTimestamp()));
+#endif  // TRITON_ENABLE_TRACING
+  }
+
+  if (err != nullptr) {
+    response->Clear();
+  }
+
+  GrpcStatusUtil::Create(&state->status_, err);
+  TRITONSERVER_ErrorDelete(err);
+
+  if (iresponse != nullptr) {
+    LOG_TRITONSERVER_ERROR(
+        TRITONSERVER_InferenceResponseDelete(iresponse),
+        "deleting GRPC inference response");
+  }
+
+  return response;
+}
+
 void
 ModelInferHandler::InferResponseComplete(
     TRITONSERVER_InferenceResponse* iresponse, const uint32_t flags,
@@ -1096,6 +1345,15 @@ ModelInferHandler::InferResponseComplete(
         TRITONSERVER_InferenceResponseDelete(iresponse),
         "deleting GRPC inference response");
 
+    // Also clean up a response stashed for deferred construction
+    // (TRITON_GRPC_RESPONSE_OFFLOAD=2) by an earlier callback.
+    if (state->deferred_iresponse_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_InferenceResponseDelete(state->deferred_iresponse_),
+          "deleting deferred GRPC inference response");
+      state->deferred_iresponse_ = nullptr;
+    }
+
     state->context_->EraseInflightState(state);
     state->step_ = Steps::CANCELLED;
 
@@ -1121,6 +1379,35 @@ ModelInferHandler::InferResponseComplete(
       state->context_->PutTaskBackToQueue(state);
       delete response_release_payload;
     }
+    return;
+  }
+
+  if (ResponseOffloadLevel() >= 2) {
+    // Defer ALL protobuf work (response object creation, output
+    // population from the scratch buffers, metadata fill, status) plus
+    // the send to the CQ handler thread: stash the core response and
+    // hand the state over. The stash is owned by the state; every
+    // consuming path must delete it exactly once.
+    if (iresponse != nullptr) {
+      if (state->deferred_iresponse_ != nullptr) {
+        // More than one response; the count is validated on the handler
+        // thread via cb_count_ and turned into an error status there.
+        LOG_TRITONSERVER_ERROR(
+            TRITONSERVER_InferenceResponseDelete(state->deferred_iresponse_),
+            "deleting deferred GRPC inference response");
+      }
+      state->deferred_iresponse_ = iresponse;
+    }
+
+    // Defer the handoff until FINAL flag is seen.
+    if (!is_final_response) {
+      return;
+    }
+
+    state->response_offload_pending_ = true;
+    state->step_ = Steps::WRITEREADY;
+    state->context_->PutTaskBackToQueue(state);
+    delete response_release_payload;
     return;
   }
 
@@ -1173,11 +1460,6 @@ ModelInferHandler::InferResponseComplete(
   }
 
 
-#ifdef TRITON_ENABLE_TRACING
-  state->trace_timestamps_.emplace_back(
-      std::make_pair("GRPC_SEND_START", TraceManager::CaptureTimestamp()));
-#endif  // TRITON_ENABLE_TRACING
-
   if (state->delay_response_completion_ms_ != 0) {
     // Will delay the Process execution of state at step COMPLETE by the
     // specified time. This can be used to test the flow when cancellation
@@ -1188,10 +1470,27 @@ ModelInferHandler::InferResponseComplete(
         std::chrono::milliseconds(state->delay_response_completion_ms_));
   }
 
-  state->step_ = Steps::COMPLETE;
-  state->context_->responder_->Finish(*response, state->status_, state);
-  if (response_created) {
-    delete response;
+  if (ResponseOffloadLevel() >= 1 && !response_created) {
+    // Hand the filled response to the completion queue so that a CQ
+    // handler thread performs the serialization + network send
+    // (responder_->Finish) instead of this model-instance thread.
+    // GRPC_SEND_START is recorded when Finish is actually issued, in
+    // ModelInferHandler::Process. 'response' stays valid across the
+    // handoff: it is owned by state->response_queue_, which is only
+    // cleared when the state is released.
+    state->response_offload_pending_ = true;
+    state->step_ = Steps::WRITEREADY;
+    state->context_->PutTaskBackToQueue(state);
+  } else {
+#ifdef TRITON_ENABLE_TRACING
+    state->trace_timestamps_.emplace_back(
+        std::make_pair("GRPC_SEND_START", TraceManager::CaptureTimestamp()));
+#endif  // TRITON_ENABLE_TRACING
+    state->step_ = Steps::COMPLETE;
+    state->context_->responder_->Finish(*response, state->status_, state);
+    if (response_created) {
+      delete response;
+    }
   }
 
   delete response_release_payload;

@@ -326,6 +326,63 @@ struct ShmInfo {
 using TensorShmMap = std::unordered_map<std::string, ShmInfo>;
 
 //
+// Records the outputs of a unary response whose protobuf construction is
+// deferred to a CQ handler thread (TRITON_GRPC_RESPONSE_OFFLOAD=2). The
+// model-instance thread only records output metadata and hands the backend
+// scratch buffers from here; all protobuf work happens later on the handler
+// thread (ModelInferHandler::Process, WRITEREADY branch). All containers
+// reuse their elements across state reuse, so after warmup the model thread
+// performs no heap allocation here.
+//
+// Thread contract: written only by the model-instance thread during the
+// backend's output stage; read only by the CQ handler thread after the
+// alarm handoff, under step_mtx_. Never accessed concurrently.
+//
+struct DeferredResponseOutputs {
+  struct Output {
+    std::string name;
+    bool in_shm = false;
+    size_t byte_size = 0;
+    size_t scratch_index = 0;  // valid when !in_shm && byte_size > 0
+  };
+
+  // Reuses a record if one is available, keeping the name string's
+  // heap capacity.
+  Output* AllocateOutput()
+  {
+    if (outputs_used_ == outputs_.size()) {
+      outputs_.emplace_back();
+    }
+    return &outputs_[outputs_used_++];
+  }
+
+  // Returns a scratch buffer of 'byte_size' bytes. std::deque keeps
+  // element addresses stable while further outputs are appended and the
+  // backend writes into previously returned buffers.
+  std::string* AllocateScratch(size_t byte_size)
+  {
+    if (scratch_used_ == scratch_.size()) {
+      scratch_.emplace_back();
+    }
+    std::string* buf = &scratch_[scratch_used_++];
+    buf->resize(byte_size);
+    return buf;
+  }
+
+  // Keep elements and their heap capacity for reuse.
+  void Reset()
+  {
+    outputs_used_ = 0;
+    scratch_used_ = 0;
+  }
+
+  std::deque<Output> outputs_;
+  std::deque<std::string> scratch_;
+  size_t outputs_used_ = 0;
+  size_t scratch_used_ = 0;
+};
+
+//
 // AllocPayload
 //
 // Simple structure that carries the userp payload needed for
@@ -345,6 +402,13 @@ struct AllocPayload {
   uint32_t response_alloc_count_;
   TensorShmMap shm_map_;
   ClassificationMap classification_map_;
+
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2 (unary only): when non-null, the
+  // allocator must not touch the response protobuf on the model-instance
+  // thread; it records outputs and hands out scratch buffers from here
+  // instead. Points at the owning state's deferred_outputs_. Set per
+  // request in ModelInferHandler::Execute; always nullptr for streaming.
+  DeferredResponseOutputs* deferred_ = nullptr;
 
   // Used to extend the lifetime of the serialized data in case
   // non-raw contents were provided in the request. Serialized data's
@@ -859,6 +923,14 @@ class InferHandlerState {
         // Issues the request cancellation to the core.
         for (auto state : inflight_states_) {
           std::lock_guard<std::recursive_mutex> lock(state->step_mtx_);
+          if (state->response_offload_pending_) {
+            // The response was already produced and handed to the
+            // completion queue (TRITON_GRPC_RESPONSE_OFFLOAD). The
+            // pending WRITEREADY alarm event will observe the cancelled
+            // context and release the state. Do not touch step_ and do
+            // not re-set the alarm: it is already armed.
+            continue;
+          }
           if (state->step_ != Steps::CANCELLED &&
               state->step_ != Steps::COMPLETE) {
             LOG_VERBOSE(1) << "Issuing cancellation for " << state->unique_id_
@@ -1179,6 +1251,17 @@ class InferHandlerState {
     cb_count_ = 0;
     is_decoupled_ = false;
     complete_ = false;
+    response_offload_pending_ = false;
+    if (deferred_iresponse_ != nullptr) {
+      // Defensive: every consuming path should have deleted it already.
+      TRITONSERVER_Error* derr =
+          TRITONSERVER_InferenceResponseDelete(deferred_iresponse_);
+      if (derr != nullptr) {
+        TRITONSERVER_ErrorDelete(derr);
+      }
+      deferred_iresponse_ = nullptr;
+    }
+    deferred_outputs_.Reset();
     parameters_ = {};
     request_.Clear();
     response_queue_->Reset();
@@ -1246,6 +1329,21 @@ class InferHandlerState {
   ::grpc::Status status_;
   std::atomic<uint32_t> cb_count_;
   bool complete_;
+  // True while a filled unary response has been handed to the completion
+  // queue (step_ == WRITEREADY, alarm event in flight) for the send to be
+  // performed on a CQ handler thread (TRITON_GRPC_RESPONSE_OFFLOAD=1).
+  bool response_offload_pending_ = false;
+
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2: the core response object carried
+  // across the handoff so that all protobuf construction, the metadata
+  // fill and the response deletion run on the CQ handler thread. Owned:
+  // whichever path consumes the state (WRITEREADY branch, cancellation,
+  // shutdown drain) must delete it exactly once.
+  TRITONSERVER_InferenceResponse* deferred_iresponse_ = nullptr;
+
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2: output records + scratch buffers the
+  // allocator fills on the model-instance thread in place of the protobuf.
+  DeferredResponseOutputs deferred_outputs_;
 
   RequestType request_;
   std::shared_ptr<ResponseQueue<ResponseType>> response_queue_;
@@ -1684,6 +1782,12 @@ class ModelInferHandler
 
  private:
   void Execute(State* state);
+  // TRITON_GRPC_RESPONSE_OFFLOAD=2: runs on a CQ handler thread; performs
+  // the protobuf work InferResponseStart / ResponseAllocatorHelper /
+  // InferResponseComplete would have done on the model-instance thread.
+  // Consumes (deletes) 'iresponse'. Must be called under state->step_mtx_.
+  inference::ModelInferResponse* BuildDeferredResponse(
+      State* state, TRITONSERVER_InferenceResponse* iresponse);
   static void InferResponseComplete(
       TRITONSERVER_InferenceResponse* response, const uint32_t flags,
       void* userp);
