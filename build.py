@@ -1655,7 +1655,10 @@ def create_build_dockerfiles(
     create_dockerfile_cibase(FLAGS.build_dir, "Dockerfile.cibase", dockerfileargmap)
 
 
-def create_docker_build_script(script_name, container_install_dir, container_ci_dir):
+def create_docker_build_script(
+    script_name, container_install_dir, container_ci_dir, build_secrets=None
+):
+    build_secrets = build_secrets or {}
     with BuildScript(
         os.path.join(FLAGS.build_dir, script_name),
         verbose=FLAGS.verbose,
@@ -1818,7 +1821,9 @@ def create_docker_build_script(script_name, container_install_dir, container_ci_
             "docker",
             "build",
         ]
-        if secrets:
+        if build_secrets:
+            requirements = build_secrets.get("req", "")
+            build_public_vllm = build_secrets.get("build_public_vllm", "true")
             finalargs += [
                 f"--secret id=req,src={requirements}",
                 f"--secret id=VLLM_INDEX_URL",
@@ -2352,7 +2357,7 @@ def enable_all():
             FLAGS.endpoint += [ep]
 
 
-if __name__ == "__main__":
+def create_arg_parser():
     parser = argparse.ArgumentParser()
 
     group_qv = parser.add_mutually_exclusive_group()
@@ -2723,7 +2728,17 @@ if __name__ == "__main__":
         default="all",
         help="The group of dependencies for Triton wheels to be installed. Default value is 'all'.",
     )
-    FLAGS = parser.parse_args()
+    return parser
+
+
+def resolve_build_config(args):
+    global FLAGS
+    FLAGS = args
+
+    EXTRA_CORE_CMAKE_FLAGS.clear()
+    OVERRIDE_CORE_CMAKE_FLAGS.clear()
+    EXTRA_BACKEND_CMAKE_FLAGS.clear()
+    OVERRIDE_BACKEND_CMAKE_FLAGS.clear()
 
     if FLAGS.image is None:
         FLAGS.image = []
@@ -3029,6 +3044,39 @@ if __name__ == "__main__":
 
     script_name = "cmake_build"
 
+    return {
+        "backends": backends,
+        "repoagents": repoagents,
+        "caches": caches,
+        "images": images,
+        "library_paths": library_paths,
+        "components": components,
+        "build_secrets": secrets,
+        "script_repo_dir": script_repo_dir,
+        "script_build_dir": script_build_dir,
+        "script_install_dir": script_install_dir,
+        "script_ci_dir": script_ci_dir,
+        "script_cmake_dir": script_cmake_dir,
+        "script_name": script_name,
+        "default_repo_tag": default_repo_tag,
+    }
+
+
+def run_build(config):
+    backends = config["backends"]
+    repoagents = config["repoagents"]
+    caches = config["caches"]
+    images = config["images"]
+    library_paths = config["library_paths"]
+    components = config["components"]
+    build_secrets = config["build_secrets"]
+    script_repo_dir = config["script_repo_dir"]
+    script_build_dir = config["script_build_dir"]
+    script_install_dir = config["script_install_dir"]
+    script_ci_dir = config["script_ci_dir"]
+    script_cmake_dir = config["script_cmake_dir"]
+    script_name = config["script_name"]
+
     # Write the build script that invokes cmake for the core, backends, repo-agents, and caches.
     pathlib.Path(FLAGS.build_dir).mkdir(parents=True, exist_ok=True)
     with BuildScript(
@@ -3141,7 +3189,9 @@ if __name__ == "__main__":
         create_build_dockerfiles(
             script_build_dir, images, backends, repoagents, caches, FLAGS.endpoint
         )
-        create_docker_build_script(script_name, script_install_dir, script_ci_dir)
+        create_docker_build_script(
+            script_name, script_install_dir, script_ci_dir, build_secrets
+        )
 
     # In not dry-run, execute the script to perform the build...  If a
     # container-based build is requested use 'docker_build' script,
@@ -3150,3 +3200,17 @@ if __name__ == "__main__":
         p = subprocess.Popen([f"./{script_name}"], cwd=FLAGS.build_dir)
         p.wait()
         fail_if(p.returncode != 0, "build failed")
+
+
+def parse_build_args(argv=None):
+    parser = create_arg_parser()
+    return resolve_build_config(parser.parse_args(argv))
+
+
+def main(argv=None):
+    config = parse_build_args(argv)
+    run_build(config)
+
+
+if __name__ == "__main__":
+    main()
