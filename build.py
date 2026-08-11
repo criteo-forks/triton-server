@@ -674,13 +674,6 @@ def onnxruntime_cmake_args(images, library_paths):
                 "onnxruntime", "TRITON_BUILD_PARALLEL", None, FLAGS.build_parallel
             )
         )
-    if FLAGS.cuda_arch_list is not None:
-        cargs.append(
-            cmake_backend_arg(
-                "onnxruntime", "TRITON_CUDA_ARCH_LIST", "STRING", FLAGS.cuda_arch_list
-            )
-        )
-
     # TRITON_ENABLE_GPU is already set for all backends in backend_cmake_args()
     if FLAGS.enable_gpu:
         # TODO: TPRD-712 TensorRT is not currently supported by our RHEL build for SBSA.
@@ -1768,6 +1761,18 @@ def create_docker_build_script(script_name, container_install_dir, container_ci_
             if os.environ.get(var):
                 runargs += ["-e", f"{var}={os.environ[var]}"]
 
+        # Forward the CUDA arch list into the buildbase container so nested
+        # backend builds honor --cuda-arch-list. Without this, the host env set
+        # in main() never reaches the container: triton-backend's
+        # define.cuda_architectures.cmake (and the ORT backend's repo-backend
+        # FetchContent) fall back to the container image's baked CUDA_ARCH_LIST,
+        # compiling architectures the user excluded and inflating artifacts.
+        # Double-quote the whole token: the arch list contains spaces and the
+        # build-script serializer joins runargs with bare spaces (see
+        # cmake_backend_arg for the same convention).
+        if FLAGS.cuda_arch_list is not None:
+            runargs += ["-e", f'"CUDA_ARCH_LIST={FLAGS.cuda_arch_list}"']
+
         runargs += ["tritonserver_buildbase"]
 
         runargs += ["./cmake_build"]
@@ -2802,9 +2807,10 @@ if __name__ == "__main__":
     if FLAGS.build_parallel is None:
         FLAGS.build_parallel = default_build_parallel()
 
-    # CUDA arch list: export into the environment so backends that read
-    # $CUDA_ARCH_LIST directly (triton-backend's define.cuda_architectures.cmake)
-    # see the same value the ONNX Runtime backend gets via TRITON_CUDA_ARCH_LIST.
+    # CUDA arch list: export into the environment so every nested build that
+    # reads $CUDA_ARCH_LIST directly picks up the requested restriction --
+    # triton-backend's define.cuda_architectures.cmake and the ONNX Runtime
+    # backend's gen_ort_dockerfile.py.
     if FLAGS.cuda_arch_list is not None:
         os.environ["CUDA_ARCH_LIST"] = FLAGS.cuda_arch_list
 
@@ -2816,8 +2822,7 @@ if __name__ == "__main__":
         if FLAGS.cuda_arch_list is not None:
             derived = min_cuda_arch(FLAGS.cuda_arch_list)
             FLAGS.min_compute_capability = (
-                derived if derived is not None
-                else DEFAULT_MIN_COMPUTE_CAPABILITY
+                derived if derived is not None else DEFAULT_MIN_COMPUTE_CAPABILITY
             )
         else:
             FLAGS.min_compute_capability = DEFAULT_MIN_COMPUTE_CAPABILITY
