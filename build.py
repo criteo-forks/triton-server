@@ -1289,6 +1289,13 @@ ENV PATH /opt/tritonserver/bin:${PATH}
 # Remove once https://github.com/openucx/ucx/pull/9148 is available
 # in the min container.
 ENV UCX_MEM_EVENTS no
+
+# Cap glibc malloc arenas. Model load/unload cycles churn short-lived
+# threads (ONNX Runtime session pools); with the default arena limit
+# (8 * cores) glibc can create a new 64MB arena per cycle whose dirty
+# pages are never returned to the OS, so process RSS and address space
+# grow monotonically with model reloads. Overridable at deploy time.
+ENV MALLOC_ARENA_MAX 2
 """
 
     # Necessary for libtorch.so to find correct HPCX libraries
