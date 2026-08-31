@@ -3997,28 +3997,212 @@ HTTPAPIServer::InferRequestClass::InferRequestClass(
 
 namespace {
 
-// Hand a callback to the connection's worker thread, retrying while that
-// thread's command socketpair is full (EVTHR_RES_RETRY <- EAGAIN under reply
-// bursts). A request paused in InferRequestClass's constructor is resumed
-// only by the deferred callback, so a dropped hand-off leaves its connection
-// paused forever and pins the request's model references until process
-// restart (GPU zombie). Briefly blocking the completion thread is the lesser
-// evil: the 208KB socketpair drains as soon as the worker runs, so retries
-// clear in microseconds unless the worker itself is gone.
-evthr_res
-DeferWithRetry(evthr_t* thread, evthr_cb callback, void* arg)
+// ---------------------------------------------------------------------------
+// Reply hand-off hardening.
+//
+// Every HTTP request is paused in InferRequestClass's constructor and resumed
+// only by a callback deferred to its connection's worker thread. A dropped
+// hand-off (worker command socketpair full -> EVTHR_RES_RETRY <- EAGAIN under
+// reply bursts) leaves the connection paused with no armed events: the
+// request is never finalized, its model references leak, and the model's
+// next unload wedges in UNLOADING holding GPU memory until pod restart.
+// ---------------------------------------------------------------------------
+
+// Retry budget for a blocked hand-off, tunable per pod without a rebuild.
+// 0 disables retries, restoring the drop-and-log behavior (A/B positive
+// control on the same image).
+int64_t
+DeferRetryBudgetMs()
 {
-  constexpr int64_t kRetryBudgetUs = 3 * 1000 * 1000;
-  int64_t waited_us = 0;
-  int64_t sleep_us = 100;
-  evthr_res res = evthr_defer(thread, callback, arg);
-  while ((res == EVTHR_RES_RETRY) && (waited_us < kRetryBudgetUs)) {
-    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-    waited_us += sleep_us;
-    sleep_us = std::min<int64_t>(sleep_us * 2, 50 * 1000);
-    res = evthr_defer(thread, callback, arg);
+  static const int64_t budget_ms = [] {
+    int64_t ms = 3000;
+    const char* env = std::getenv("TRITON_HTTP_DEFER_RETRY_BUDGET_MS");
+    if (env != nullptr) {
+      char* end = nullptr;
+      const long long parsed = std::strtoll(env, &end, 10);
+      if ((end != env) && (*end == '\0') && (parsed >= 0)) {
+        ms = parsed;
+      } else {
+        LOG_ERROR << "ignoring invalid TRITON_HTTP_DEFER_RETRY_BUDGET_MS='"
+                  << env << "', using " << ms << "ms";
+      }
+    }
+    LOG_INFO << "HTTP reply hand-off retry budget: " << ms << "ms"
+             << ((ms == 0) ? " (retries disabled)" : "");
+    return ms;
+  }();
+  return budget_ms;
+}
+
+// Hand-off retry/drop accounting, exported on the metrics endpoint so fleets
+// can alert on pods that will leak (drops) or run hot (retries). Also tracks
+// per-worker consecutive budget exhaustions: a worker whose command pipe
+// stays full through several whole budgets is dead or wedged, and sleeping
+// on it only stalls completion threads.
+class DeferTelemetry {
+ public:
+  static DeferTelemetry& Get()
+  {
+    static DeferTelemetry singleton;
+    return singleton;
   }
-  return res;
+
+  void RecordRetriedSuccess(const char* site, int64_t waited_us)
+  {
+    const uint64_t n = ++retried_;
+#ifdef TRITON_ENABLE_METRICS
+    if (retried_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(retried_metric_, 1),
+          "incrementing retried hand-off metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+    // First occurrence, every 100th, and any unusually long wait: enough to
+    // see congestion in logs without flooding them.
+    if ((n == 1) || ((n % 100) == 0) || (waited_us > 100000)) {
+      LOG_INFO << "FULL-SOCKETS: " << site << " hand-off delivered after "
+               << (waited_us / 1000.0)
+               << "ms of retries (retried hand-offs: " << n
+               << "): worker command pipe filled under reply burst";
+    }
+  }
+
+  void RecordDrop(const char* site, evthr_t* thread)
+  {
+    const uint64_t n = ++dropped_;
+#ifdef TRITON_ENABLE_METRICS
+    if (dropped_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(dropped_metric_, 1),
+          "incrementing dropped hand-off metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+    LOG_ERROR << "FULL-SOCKETS: " << site << " hand-off DROPPED (total " << n
+              << ", worker " << thread
+              << "): this request's connection stays paused and its model "
+                 "references leak; that model's next unload will wedge in "
+                 "UNLOADING and hold its GPU memory. Restart this pod at the "
+                 "next opportunity.";
+  }
+
+  bool WorkerCircuitOpen(evthr_t* thread)
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = exhaustions_.find(thread);
+    return (it != exhaustions_.end()) && (it->second >= kCircuitOpenThreshold);
+  }
+
+  void RecordWorkerOk(evthr_t* thread)
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    exhaustions_.erase(thread);
+  }
+
+  void RecordWorkerExhausted(evthr_t* thread)
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const int n = ++exhaustions_[thread];
+    if (n == kCircuitOpenThreshold) {
+      LOG_ERROR << "FULL-SOCKETS: worker " << thread << " exhausted " << n
+                << " consecutive retry budgets - presuming it dead and "
+                   "failing its hand-offs fast from now on (a successful "
+                   "hand-off re-arms retries)";
+    }
+  }
+
+ private:
+  DeferTelemetry()
+  {
+#ifdef TRITON_ENABLE_METRICS
+    auto create = [](const char* name, const char* description,
+                     TRITONSERVER_MetricFamily** family,
+                     TRITONSERVER_Metric** metric) {
+      TRITONSERVER_Error* err = TRITONSERVER_MetricFamilyNew(
+          family, TRITONSERVER_METRIC_KIND_COUNTER, name, description);
+      if (err == nullptr) {
+        err = TRITONSERVER_MetricNew(metric, *family, nullptr /* labels */, 0);
+      }
+      if (err != nullptr) {
+        LOG_ERROR << "failed to register " << name
+                  << " metric: " << TRITONSERVER_ErrorMessage(err);
+        TRITONSERVER_ErrorDelete(err);
+      }
+    };
+    create(
+        "nv_http_reply_handoff_retried",
+        "Number of HTTP reply hand-offs delivered only after retrying a full "
+        "worker command pipe",
+        &retried_family_, &retried_metric_);
+    create(
+        "nv_http_reply_handoff_dropped",
+        "Number of HTTP reply hand-offs dropped after exhausting the retry "
+        "budget; each leaks model references until pod restart",
+        &dropped_family_, &dropped_metric_);
+#endif  // TRITON_ENABLE_METRICS
+  }
+
+  static constexpr int kCircuitOpenThreshold = 3;
+
+  std::atomic<uint64_t> retried_{0};
+  std::atomic<uint64_t> dropped_{0};
+  std::mutex mu_;
+  std::unordered_map<evthr_t*, int> exhaustions_;
+#ifdef TRITON_ENABLE_METRICS
+  TRITONSERVER_MetricFamily* retried_family_ = nullptr;
+  TRITONSERVER_Metric* retried_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* dropped_family_ = nullptr;
+  TRITONSERVER_Metric* dropped_metric_ = nullptr;
+#endif  // TRITON_ENABLE_METRICS
+};
+
+// Hand 'callback' to the connection's worker thread, retrying with backoff
+// while the worker's command socketpair is full. Returns true when the
+// hand-off was delivered; on false the request is leaked and telemetry has
+// already logged/counted it. Blocking the completion thread briefly is the
+// lesser evil: the pipe drains as soon as the worker runs, so real retries
+// clear in microseconds. 'defer_fn' is injectable for tests.
+using DeferFn = evthr_res (*)(evthr_t*, evthr_cb, void*);
+
+bool
+DeferHandoff(
+    evthr_t* thread, evthr_cb callback, void* arg, const char* site,
+    DeferFn defer_fn = evthr_defer)
+{
+  auto& telemetry = DeferTelemetry::Get();
+  evthr_res res = defer_fn(thread, callback, arg);
+  if (res == EVTHR_RES_OK) {
+    telemetry.RecordWorkerOk(thread);
+    return true;
+  }
+
+  const int64_t budget_ms = DeferRetryBudgetMs();
+  if ((res == EVTHR_RES_RETRY) && (budget_ms > 0) &&
+      !telemetry.WorkerCircuitOpen(thread)) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(budget_ms);
+    int64_t sleep_us = 100;
+    while (std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+      sleep_us = std::min<int64_t>(sleep_us * 2, 50000);
+      res = defer_fn(thread, callback, arg);
+      if (res == EVTHR_RES_OK) {
+        telemetry.RecordWorkerOk(thread);
+        telemetry.RecordRetriedSuccess(
+            site, std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - start)
+                      .count());
+        return true;
+      }
+      if (res != EVTHR_RES_RETRY) {
+        break;
+      }
+    }
+    if (res == EVTHR_RES_RETRY) {
+      telemetry.RecordWorkerExhausted(thread);
+    }
+  }
+  telemetry.RecordDrop(site, thread);
+  return false;
 }
 
 }  // namespace
@@ -4091,14 +4275,9 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
     return;
   }
-  if (DeferWithRetry(
-          infer_request->thread_, InferRequestClass::ReplyCallback,
-          infer_request) != EVTHR_RES_OK) {
-    LOG_ERROR << "FULL-SOCKETS: evthr_defer(ReplyCallback) still failing after "
-                 "retry budget: reply hand-off dropped, request will hang. "
-                 "infer_request=" << infer_request
-              << " thread=" << infer_request->thread_;
-  }
+  DeferHandoff(
+      infer_request->thread_, InferRequestClass::ReplyCallback, infer_request,
+      "ReplyCallback");
 }
 
 TRITONSERVER_Error*
@@ -4446,12 +4625,10 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
   // so user should check response body in case of error at later time.
   if (infer_request->IncrementResponseCount() == 0) {
     infer_request->response_code_ = HttpCodeFromError(err);
-    if (DeferWithRetry(infer_request->thread_, StartResponse, infer_request) !=
-        EVTHR_RES_OK) {
-      LOG_ERROR << "FULL-SOCKETS: evthr_defer(StartResponse) still failing "
-                   "after retry budget: reply hand-off dropped, request will "
-                   "hang. infer_request=" << infer_request
-                << " thread=" << infer_request->thread_;
+    if (!DeferHandoff(
+            infer_request->thread_, StartResponse, infer_request,
+            "StartResponse")) {
+      infer_request->handoff_failed_ = true;
     }
   }
 
@@ -4463,21 +4640,20 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 #endif  // TRITON_ENABLE_TRACING
 
   // Final flag indicates there is no more responses, ending chunked response.
-  if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
-    if (DeferWithRetry(infer_request->thread_, EndResponseCallback,
-                       infer_request) != EVTHR_RES_OK) {
-      LOG_ERROR << "FULL-SOCKETS: evthr_defer(EndResponseCallback) still "
-                   "failing after retry budget: reply hand-off dropped, "
-                   "request will hang. infer_request=" << infer_request
-                << " thread=" << infer_request->thread_;
+  if (infer_request->handoff_failed_) {
+    // A hand-off for this stream was already dropped and the request is
+    // leaked; don't pump further callbacks into the broken stream.
+  } else if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
+    if (!DeferHandoff(
+            infer_request->thread_, EndResponseCallback, infer_request,
+            "EndResponseCallback")) {
+      infer_request->handoff_failed_ = true;
     }
   } else {
-    if (DeferWithRetry(infer_request->thread_, ChunkResponseCallback,
-                       infer_request) != EVTHR_RES_OK) {
-      LOG_ERROR << "FULL-SOCKETS: evthr_defer(ChunkResponseCallback) still "
-                   "failing after retry budget: reply hand-off dropped, "
-                   "request will hang. infer_request=" << infer_request
-                << " thread=" << infer_request->thread_;
+    if (!DeferHandoff(
+            infer_request->thread_, ChunkResponseCallback, infer_request,
+            "ChunkResponseCallback")) {
+      infer_request->handoff_failed_ = true;
     }
   }
 

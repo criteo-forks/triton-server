@@ -28,6 +28,7 @@
 #include <evhtp/evhtp.h>
 #include <re2/re2.h>
 
+#include <atomic>
 #include <list>
 #include <map>
 #include <memory>
@@ -402,6 +403,11 @@ class HTTPAPIServer : public HTTPServer {
     {
     }
     virtual ~GenerateRequestClass();
+
+    // Set when a reply hand-off for this stream was dropped (the request is
+    // leaked); suppresses further hand-offs into the broken stream. See
+    // DeferHandoff in http_server.cc.
+    std::atomic<bool> handoff_failed_{false};
 
     TRITONSERVER_Server* EvHtpServer() const { return server_; }
 
