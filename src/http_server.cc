@@ -35,12 +35,14 @@
 #include <re2/re2.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <list>
 #include <regex>
 #include <thread>
 
 #include "classification.h"
+#include "http_reply_handoff.h"
 
 #define TRITONJSON_STATUSTYPE TRITONSERVER_Error*
 #define TRITONJSON_STATUSRETURN(M) \
@@ -54,6 +56,11 @@ namespace triton { namespace server {
 // thread). Increment in ChunkCountIncrement. Caps evbuffer fan-out / RSS.
 constexpr uint64_t kMaxChunkedChunks =
     1 << 16;  // reject on chunk count > kMaxChunkedChunks (65536)
+
+namespace {
+// Defined with the reply hand-off machinery further below.
+int64_t DeferRetryBudgetMs();
+}  // namespace
 
 #define RETURN_AND_CALLBACK_IF_ERR(X, CALLBACK) \
   do {                                          \
@@ -1191,6 +1198,10 @@ HTTPAPIServer::HTTPAPIServer(
       trace_regex_(R"(/v2/trace/setting)"), max_input_size_(max_input_size),
       restricted_apis_(restricted_apis)
 {
+  // Parse and log the reply hand-off retry budget now so an invalid
+  // TRITON_HTTP_DEFER_RETRY_BUDGET_MS surfaces at startup, not mid-traffic.
+  DeferRetryBudgetMs();
+
   // FIXME, don't cache server metadata. The http endpoint should
   // not be deciding that server metadata will not change during
   // execution.
@@ -3994,6 +4005,244 @@ HTTPAPIServer::InferRequestClass::InferRequestClass(
       reinterpret_cast<void*>(this));
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Reply hand-off hardening.
+//
+// Every HTTP request is paused in InferRequestClass's constructor and resumed
+// only by a callback deferred to its connection's worker thread. A dropped
+// hand-off (worker command socketpair full -> EVTHR_RES_RETRY <- EAGAIN under
+// reply bursts) leaves the connection paused with no armed events: the
+// request is never finalized, its model references leak, and the model's
+// next unload wedges in UNLOADING holding GPU memory until pod restart.
+// ---------------------------------------------------------------------------
+
+// Retry budget for a blocked hand-off, tunable per pod without a rebuild.
+// 0 disables retries, restoring the drop-and-log behavior (A/B positive
+// control on the same image).
+int64_t
+DeferRetryBudgetMs()
+{
+  static const int64_t budget_ms = [] {
+    int64_t ms = 3000;
+    const char* env = std::getenv("TRITON_HTTP_DEFER_RETRY_BUDGET_MS");
+    if (env != nullptr) {
+      char* end = nullptr;
+      const long long parsed = std::strtoll(env, &end, 10);
+      if ((end != env) && (*end == '\0') && (parsed >= 0)) {
+        ms = parsed;
+      } else {
+        LOG_ERROR << "ignoring invalid TRITON_HTTP_DEFER_RETRY_BUDGET_MS='"
+                  << env << "', using " << ms << "ms";
+      }
+    }
+    LOG_INFO << "HTTP reply hand-off retry budget: " << ms << "ms"
+             << ((ms == 0) ? " (retries disabled)" : "");
+    return ms;
+  }();
+  return budget_ms;
+}
+
+// Hand-off retry/drop accounting, exported on the metrics endpoint so fleets
+// can alert on pods that will leak (drops) or run hot (retries). Also tracks
+// per-worker consecutive budget exhaustions: a worker whose command pipe
+// stays full through several whole budgets is dead or wedged, and sleeping
+// on it only stalls completion threads.
+class DeferTelemetry {
+ public:
+  static DeferTelemetry& Get()
+  {
+    // Deliberately leaked: metric families live for the process lifetime.
+    static DeferTelemetry singleton;
+    return singleton;
+  }
+
+  void RecordRetriedSuccess(const char* site, int64_t waited_us)
+  {
+    const uint64_t n = ++retried_;
+#ifdef TRITON_ENABLE_METRICS
+    if (retried_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(retried_metric_, 1),
+          "incrementing retried hand-off metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+    // First occurrence, every 100th, and any unusually long wait: enough to
+    // see congestion in logs without flooding them.
+    if ((n == 1) || ((n % 100) == 0) || (waited_us > 100000)) {
+      LOG_INFO << "FULL-SOCKETS: " << site << " hand-off delivered after "
+               << (waited_us / 1000.0)
+               << "ms of retries (retried hand-offs: " << n
+               << "): worker command pipe filled under reply burst";
+    }
+  }
+
+  void RecordDrop(const char* site, evthr_t* thread)
+  {
+    const uint64_t n = ++dropped_;
+#ifdef TRITON_ENABLE_METRICS
+    if (dropped_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(dropped_metric_, 1),
+          "incrementing dropped hand-off metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+    LOG_ERROR << "FULL-SOCKETS: " << site << " hand-off DROPPED (total " << n
+              << ", worker " << thread
+              << "): this request's connection stays paused and its model "
+                 "references leak; that model's next unload will wedge in "
+                 "UNLOADING and hold its GPU memory. Restart this pod at the "
+                 "next opportunity.";
+  }
+
+  bool WorkerCircuitOpen(evthr_t* thread) { return circuit_.Open(thread); }
+
+  void RecordWorkerOk(evthr_t* thread) { circuit_.Ok(thread); }
+
+  void RecordWorkerExhausted(evthr_t* thread)
+  {
+    const int n = circuit_.Exhausted(thread);
+    if (n == circuit_.Threshold()) {
+      LOG_ERROR << "FULL-SOCKETS: worker " << thread << " exhausted " << n
+                << " consecutive retry budgets - presuming it dead and "
+                   "failing its hand-offs fast from now on (a successful "
+                   "hand-off re-arms retries)";
+    }
+  }
+
+ private:
+  DeferTelemetry()
+  {
+#ifdef TRITON_ENABLE_METRICS
+    auto create = [](const char* name, const char* description,
+                     TRITONSERVER_MetricFamily** family,
+                     TRITONSERVER_Metric** metric) {
+      TRITONSERVER_Error* err = TRITONSERVER_MetricFamilyNew(
+          family, TRITONSERVER_METRIC_KIND_COUNTER, name, description);
+      if (err == nullptr) {
+        err = TRITONSERVER_MetricNew(metric, *family, nullptr /* labels */, 0);
+      }
+      if (err != nullptr) {
+        LOG_ERROR << "failed to register " << name
+                  << " metric: " << TRITONSERVER_ErrorMessage(err);
+        TRITONSERVER_ErrorDelete(err);
+      }
+    };
+    create(
+        "nv_http_reply_handoff_retried",
+        "Number of HTTP reply hand-offs delivered only after retrying a full "
+        "worker command pipe",
+        &retried_family_, &retried_metric_);
+    create(
+        "nv_http_reply_handoff_dropped",
+        "Number of HTTP reply hand-offs dropped after exhausting the retry "
+        "budget; each leaks model references until pod restart",
+        &dropped_family_, &dropped_metric_);
+#endif  // TRITON_ENABLE_METRICS
+  }
+
+  std::atomic<uint64_t> retried_{0};
+  std::atomic<uint64_t> dropped_{0};
+  WorkerCircuit circuit_;
+#ifdef TRITON_ENABLE_METRICS
+  TRITONSERVER_MetricFamily* retried_family_ = nullptr;
+  TRITONSERVER_Metric* retried_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* dropped_family_ = nullptr;
+  TRITONSERVER_Metric* dropped_metric_ = nullptr;
+#endif  // TRITON_ENABLE_METRICS
+};
+
+// Attribute a dropped hand-off's leaked reference to its model in the core
+// repository index (best-effort; a failure only loses the annotation).
+void
+ReportLeakedModelReference(
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version)
+{
+  if ((server == nullptr) || model_name.empty() || (model_version < 0)) {
+    return;
+  }
+  TRITONSERVER_Error* err = TRITONSERVER_ServerModelReportLeakedReference(
+      server, model_name.c_str(), model_version);
+  if (err != nullptr) {
+    LOG_ERROR << "failed to report leaked reference for model '" << model_name
+              << "' version " << model_version << ": "
+              << TRITONSERVER_ErrorMessage(err);
+    TRITONSERVER_ErrorDelete(err);
+  }
+}
+
+// Hand 'callback' to the connection's worker thread via RetryDefer (see
+// http_reply_handoff.h), recording telemetry; if the hand-off is ultimately
+// dropped, attribute the leaked request to 'model_name'/'model_version' in
+// the repository index. Returns true when delivered.
+//
+// Blocking this (completion) thread is deliberate: a request's hand-offs
+// (StartResponse -> Chunk... -> End) must reach the worker in order, and a
+// deferred retry queue would reorder them unless serialized per request.
+// The pipe drains as soon as the worker runs, so real retries clear in
+// microseconds; the circuit breaker bounds the dead-worker case.
+// 'defer_fn' is injectable for tests.
+bool
+DeferHandoff(
+    evthr_t* thread, evthr_cb callback, void* arg, const char* site,
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version, DeferFn defer_fn = evthr_defer)
+{
+  auto& telemetry = DeferTelemetry::Get();
+  const int64_t budget_ms =
+      telemetry.WorkerCircuitOpen(thread) ? 0 : DeferRetryBudgetMs();
+  int64_t waited_us = 0;
+  const evthr_res res =
+      RetryDefer(thread, callback, arg, budget_ms, defer_fn, &waited_us);
+  if (res == EVTHR_RES_OK) {
+    telemetry.RecordWorkerOk(thread);
+    if (waited_us > 0) {
+      telemetry.RecordRetriedSuccess(site, waited_us);
+    }
+    return true;
+  }
+  if (res == EVTHR_RES_RETRY) {
+    if (budget_ms > 0) {
+      telemetry.RecordWorkerExhausted(thread);
+    }
+    telemetry.RecordDrop(site, thread);
+    ReportLeakedModelReference(server, model_name, model_version);
+    return false;
+  }
+  // EVTHR_RES_FATAL or unknown: not a queue-full drop (typically server
+  // shutdown or invalid arguments) - don't attribute a leak that may not be
+  // real, since a report cannot be retracted.
+  LOG_ERROR << "FULL-SOCKETS: " << site
+            << " hand-off failed (evthr_defer=" << res
+            << ", non-retryable); request will not complete";
+  return false;
+}
+
+}  // namespace
+
+void
+HTTPAPIServer::InferRequestClass::CaptureModelIdentity(
+    InferRequestClass* infer_request, TRITONSERVER_InferenceResponse* response)
+{
+  if (response == nullptr) {
+    return;
+  }
+  const char* model_name = nullptr;
+  int64_t model_version = -1;
+  TRITONSERVER_Error* err = TRITONSERVER_InferenceResponseModel(
+      response, &model_name, &model_version);
+  if (err != nullptr) {
+    TRITONSERVER_ErrorDelete(err);
+    return;
+  }
+  if (model_name != nullptr) {
+    infer_request->leak_model_name_ = model_name;
+    infer_request->leak_model_version_ = model_version;
+  }
+}
+
 void
 HTTPAPIServer::InferRequestClass::InferRequestComplete(
     TRITONSERVER_InferenceRequest* request, const uint32_t flags, void* userp)
@@ -4048,6 +4297,8 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   }
 
 
+  CaptureModelIdentity(infer_request, response);
+
   LOG_TRITONSERVER_ERROR(
       TRITONSERVER_InferenceResponseDelete(response),
       "deleting inference response");
@@ -4062,8 +4313,10 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
     return;
   }
-  evthr_defer(
-      infer_request->thread_, InferRequestClass::ReplyCallback, infer_request);
+  DeferHandoff(
+      infer_request->thread_, InferRequestClass::ReplyCallback, infer_request,
+      "ReplyCallback", infer_request->server_, infer_request->leak_model_name_,
+      infer_request->leak_model_version_);
 }
 
 TRITONSERVER_Error*
@@ -4398,6 +4651,8 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 
   // Assuming responses of the same request is sent in sequence.
 
+  CaptureModelIdentity(infer_request, response);
+
   TRITONSERVER_Error* err = nullptr;
   if (response != nullptr) {
     err = infer_request->FinalizeResponse(response);
@@ -4411,7 +4666,13 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
   // so user should check response body in case of error at later time.
   if (infer_request->IncrementResponseCount() == 0) {
     infer_request->response_code_ = HttpCodeFromError(err);
-    evthr_defer(infer_request->thread_, StartResponse, infer_request);
+    if (!DeferHandoff(
+            infer_request->thread_, StartResponse, infer_request,
+            "StartResponse", infer_request->server_,
+            infer_request->leak_model_name_,
+            infer_request->leak_model_version_)) {
+      infer_request->handoff_failed_ = true;
+    }
   }
 
 #ifdef TRITON_ENABLE_TRACING
@@ -4422,10 +4683,25 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 #endif  // TRITON_ENABLE_TRACING
 
   // Final flag indicates there is no more responses, ending chunked response.
-  if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
-    evthr_defer(infer_request->thread_, EndResponseCallback, infer_request);
+  if (infer_request->handoff_failed_) {
+    // A hand-off for this stream was already dropped and the request is
+    // leaked; don't pump further callbacks into the broken stream.
+  } else if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
+    if (!DeferHandoff(
+            infer_request->thread_, EndResponseCallback, infer_request,
+            "EndResponseCallback", infer_request->server_,
+            infer_request->leak_model_name_,
+            infer_request->leak_model_version_)) {
+      infer_request->handoff_failed_ = true;
+    }
   } else {
-    evthr_defer(infer_request->thread_, ChunkResponseCallback, infer_request);
+    if (!DeferHandoff(
+            infer_request->thread_, ChunkResponseCallback, infer_request,
+            "ChunkResponseCallback", infer_request->server_,
+            infer_request->leak_model_name_,
+            infer_request->leak_model_version_)) {
+      infer_request->handoff_failed_ = true;
+    }
   }
 
   LOG_TRITONSERVER_ERROR(
