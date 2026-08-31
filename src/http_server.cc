@@ -4205,6 +4205,28 @@ DeferHandoff(
   return false;
 }
 
+// Attribute a dropped hand-off's leaked reference to its model in the core
+// repository index, so the version is reported as stuck deterministically
+// (no reliance on the stuck-unload timeout). Best-effort: a failure only
+// loses the annotation, never the request accounting above.
+void
+ReportLeakedModelReference(
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version)
+{
+  if ((server == nullptr) || model_name.empty()) {
+    return;
+  }
+  TRITONSERVER_Error* err = TRITONSERVER_ServerModelReportLeakedReference(
+      server, model_name.c_str(), model_version);
+  if (err != nullptr) {
+    LOG_ERROR << "failed to report leaked reference for model '" << model_name
+              << "' version " << model_version << ": "
+              << TRITONSERVER_ErrorMessage(err);
+    TRITONSERVER_ErrorDelete(err);
+  }
+}
+
 }  // namespace
 
 void
@@ -4261,6 +4283,21 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   }
 
 
+  if (response != nullptr) {
+    const char* rmodel_name = nullptr;
+    int64_t rmodel_version = -1;
+    TRITONSERVER_Error* model_err = TRITONSERVER_InferenceResponseModel(
+        response, &rmodel_name, &rmodel_version);
+    if (model_err == nullptr) {
+      if (rmodel_name != nullptr) {
+        infer_request->leak_model_name_ = rmodel_name;
+        infer_request->leak_model_version_ = rmodel_version;
+      }
+    } else {
+      TRITONSERVER_ErrorDelete(model_err);
+    }
+  }
+
   LOG_TRITONSERVER_ERROR(
       TRITONSERVER_InferenceResponseDelete(response),
       "deleting inference response");
@@ -4275,9 +4312,13 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
     return;
   }
-  DeferHandoff(
-      infer_request->thread_, InferRequestClass::ReplyCallback, infer_request,
-      "ReplyCallback");
+  if (!DeferHandoff(
+          infer_request->thread_, InferRequestClass::ReplyCallback,
+          infer_request, "ReplyCallback")) {
+    ReportLeakedModelReference(
+        infer_request->server_, infer_request->leak_model_name_,
+        infer_request->leak_model_version_);
+  }
 }
 
 TRITONSERVER_Error*
@@ -4612,6 +4653,21 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 
   // Assuming responses of the same request is sent in sequence.
 
+  if (response != nullptr) {
+    const char* rmodel_name = nullptr;
+    int64_t rmodel_version = -1;
+    TRITONSERVER_Error* model_err = TRITONSERVER_InferenceResponseModel(
+        response, &rmodel_name, &rmodel_version);
+    if (model_err == nullptr) {
+      if (rmodel_name != nullptr) {
+        infer_request->leak_model_name_ = rmodel_name;
+        infer_request->leak_model_version_ = rmodel_version;
+      }
+    } else {
+      TRITONSERVER_ErrorDelete(model_err);
+    }
+  }
+
   TRITONSERVER_Error* err = nullptr;
   if (response != nullptr) {
     err = infer_request->FinalizeResponse(response);
@@ -4629,6 +4685,9 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
             infer_request->thread_, StartResponse, infer_request,
             "StartResponse")) {
       infer_request->handoff_failed_ = true;
+      ReportLeakedModelReference(
+          infer_request->server_, infer_request->leak_model_name_,
+          infer_request->leak_model_version_);
     }
   }
 
@@ -4648,12 +4707,18 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
             infer_request->thread_, EndResponseCallback, infer_request,
             "EndResponseCallback")) {
       infer_request->handoff_failed_ = true;
+      ReportLeakedModelReference(
+          infer_request->server_, infer_request->leak_model_name_,
+          infer_request->leak_model_version_);
     }
   } else {
     if (!DeferHandoff(
             infer_request->thread_, ChunkResponseCallback, infer_request,
             "ChunkResponseCallback")) {
       infer_request->handoff_failed_ = true;
+      ReportLeakedModelReference(
+          infer_request->server_, infer_request->leak_model_name_,
+          infer_request->leak_model_version_);
     }
   }
 

@@ -358,6 +358,13 @@ class HTTPAPIServer : public HTTPServer {
     evhtp_request_t* req_{nullptr};
     evthr_t* thread_{nullptr};
 
+    // Identity of the model serving this request, captured from the first
+    // response; used to attribute the leaked reference to the model in the
+    // repository index if a reply hand-off is dropped. See DeferHandoff in
+    // http_server.cc.
+    std::string leak_model_name_;
+    int64_t leak_model_version_{-1};
+
     DataCompressor::Type response_compression_type_{
         DataCompressor::Type::IDENTITY};
 
