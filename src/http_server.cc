@@ -35,6 +35,7 @@
 #include <re2/re2.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <list>
 #include <regex>
@@ -3994,6 +3995,34 @@ HTTPAPIServer::InferRequestClass::InferRequestClass(
       reinterpret_cast<void*>(this));
 }
 
+namespace {
+
+// Hand a callback to the connection's worker thread, retrying while that
+// thread's command socketpair is full (EVTHR_RES_RETRY <- EAGAIN under reply
+// bursts). A request paused in InferRequestClass's constructor is resumed
+// only by the deferred callback, so a dropped hand-off leaves its connection
+// paused forever and pins the request's model references until process
+// restart (GPU zombie). Briefly blocking the completion thread is the lesser
+// evil: the 208KB socketpair drains as soon as the worker runs, so retries
+// clear in microseconds unless the worker itself is gone.
+evthr_res
+DeferWithRetry(evthr_t* thread, evthr_cb callback, void* arg)
+{
+  constexpr int64_t kRetryBudgetUs = 3 * 1000 * 1000;
+  int64_t waited_us = 0;
+  int64_t sleep_us = 100;
+  evthr_res res = evthr_defer(thread, callback, arg);
+  while ((res == EVTHR_RES_RETRY) && (waited_us < kRetryBudgetUs)) {
+    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+    waited_us += sleep_us;
+    sleep_us = std::min<int64_t>(sleep_us * 2, 50 * 1000);
+    res = evthr_defer(thread, callback, arg);
+  }
+  return res;
+}
+
+}  // namespace
+
 void
 HTTPAPIServer::InferRequestClass::InferRequestComplete(
     TRITONSERVER_InferenceRequest* request, const uint32_t flags, void* userp)
@@ -4062,15 +4091,11 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
     return;
   }
-  if (evthr_defer(
+  if (DeferWithRetry(
           infer_request->thread_, InferRequestClass::ReplyCallback,
           infer_request) != EVTHR_RES_OK) {
-    // DIAGNOSTIC (test/full-sockets): the reply hand-off to the worker thread was
-    // dropped because its evthr command socketpair send buffer is full (EAGAIN ->
-    // EVTHR_RES_RETRY). ReplyCallback never runs, so the request is never resumed
-    // and its references (incl. the model) are never released -> hang / zombie.
-    LOG_ERROR << "FULL-SOCKETS: evthr_defer(ReplyCallback) returned non-OK "
-                 "(EVTHR_RES_RETRY): reply hand-off dropped, request may hang. "
+    LOG_ERROR << "FULL-SOCKETS: evthr_defer(ReplyCallback) still failing after "
+                 "retry budget: reply hand-off dropped, request will hang. "
                  "infer_request=" << infer_request
               << " thread=" << infer_request->thread_;
   }
@@ -4421,11 +4446,11 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
   // so user should check response body in case of error at later time.
   if (infer_request->IncrementResponseCount() == 0) {
     infer_request->response_code_ = HttpCodeFromError(err);
-    if (evthr_defer(infer_request->thread_, StartResponse, infer_request) !=
+    if (DeferWithRetry(infer_request->thread_, StartResponse, infer_request) !=
         EVTHR_RES_OK) {
-      LOG_ERROR << "FULL-SOCKETS: evthr_defer(StartResponse) returned non-OK "
-                   "(EVTHR_RES_RETRY): reply hand-off dropped, request may hang. "
-                   "infer_request=" << infer_request
+      LOG_ERROR << "FULL-SOCKETS: evthr_defer(StartResponse) still failing "
+                   "after retry budget: reply hand-off dropped, request will "
+                   "hang. infer_request=" << infer_request
                 << " thread=" << infer_request->thread_;
     }
   }
@@ -4439,19 +4464,19 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 
   // Final flag indicates there is no more responses, ending chunked response.
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
-    if (evthr_defer(infer_request->thread_, EndResponseCallback,
-                    infer_request) != EVTHR_RES_OK) {
-      LOG_ERROR << "FULL-SOCKETS: evthr_defer(EndResponseCallback) returned "
-                   "non-OK (EVTHR_RES_RETRY): reply hand-off dropped, request "
-                   "may hang. infer_request=" << infer_request
+    if (DeferWithRetry(infer_request->thread_, EndResponseCallback,
+                       infer_request) != EVTHR_RES_OK) {
+      LOG_ERROR << "FULL-SOCKETS: evthr_defer(EndResponseCallback) still "
+                   "failing after retry budget: reply hand-off dropped, "
+                   "request will hang. infer_request=" << infer_request
                 << " thread=" << infer_request->thread_;
     }
   } else {
-    if (evthr_defer(infer_request->thread_, ChunkResponseCallback,
-                    infer_request) != EVTHR_RES_OK) {
-      LOG_ERROR << "FULL-SOCKETS: evthr_defer(ChunkResponseCallback) returned "
-                   "non-OK (EVTHR_RES_RETRY): reply hand-off dropped, request "
-                   "may hang. infer_request=" << infer_request
+    if (DeferWithRetry(infer_request->thread_, ChunkResponseCallback,
+                       infer_request) != EVTHR_RES_OK) {
+      LOG_ERROR << "FULL-SOCKETS: evthr_defer(ChunkResponseCallback) still "
+                   "failing after retry budget: reply hand-off dropped, "
+                   "request will hang. infer_request=" << infer_request
                 << " thread=" << infer_request->thread_;
     }
   }
