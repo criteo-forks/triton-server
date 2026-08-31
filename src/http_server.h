@@ -28,6 +28,7 @@
 #include <evhtp/evhtp.h>
 #include <re2/re2.h>
 
+#include <atomic>
 #include <list>
 #include <map>
 #include <memory>
@@ -352,10 +353,22 @@ class HTTPAPIServer : public HTTPServer {
       shm_regions_info_.push_back(shm_info);
     }
 
+    // Record the serving model's identity from 'response' for leak
+    // attribution; no-op when 'response' is null.
+    static void CaptureModelIdentity(
+        InferRequestClass* infer_request,
+        TRITONSERVER_InferenceResponse* response);
+
    protected:
     TRITONSERVER_Server* server_{nullptr};
     evhtp_request_t* req_{nullptr};
     evthr_t* thread_{nullptr};
+
+    // Model identity from the first response, for leak attribution on a
+    // dropped hand-off (see DeferHandoff in http_server.cc). A request that
+    // never produced a response leaks unattributed (metrics only).
+    std::string leak_model_name_;
+    int64_t leak_model_version_{-1};
 
     DataCompressor::Type response_compression_type_{
         DataCompressor::Type::IDENTITY};
@@ -434,6 +447,10 @@ class HTTPAPIServer : public HTTPServer {
     const MappingSchema* ResponseSchema() { return response_schema_; }
 
    private:
+    // Set when a reply hand-off for this stream was dropped; suppresses
+    // further hand-offs (see DeferHandoff in http_server.cc).
+    std::atomic<bool> handoff_failed_{false};
+
     struct TritonOutput {
       enum class Type { RESERVED, TENSOR, PARAMETER };
       TritonOutput(Type t, const std::string& val) : type(t), value(val) {}
