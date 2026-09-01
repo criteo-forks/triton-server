@@ -43,6 +43,7 @@
 
 #include "classification.h"
 #include "http_reply_handoff.h"
+#include "http_reply_queue.h"
 
 #define TRITONJSON_STATUSTYPE TRITONSERVER_Error*
 #define TRITONJSON_STATUSRETURN(M) \
@@ -60,6 +61,8 @@ constexpr uint64_t kMaxChunkedChunks =
 namespace {
 // Defined with the reply hand-off machinery further below.
 int64_t DeferRetryBudgetMs();
+void WorkerInit(evhtp_t* htp, evthr_t* thread, void* arg);
+void WorkerExit(evhtp_t* htp, evthr_t* thread, void* arg);
 }  // namespace
 
 #define RETURN_AND_CALLBACK_IF_ERR(X, CALLBACK) \
@@ -223,7 +226,7 @@ HTTPServer::Start()
     }
     evhtp_set_gencb(htp_, HTTPServer::Dispatch, this);
     evhtp_set_pre_accept_cb(htp_, HTTPServer::NewConnection, this);
-    evhtp_use_threads_wexit(htp_, NULL, NULL, thread_cnt_, NULL);
+    evhtp_use_threads_wexit(htp_, WorkerInit, WorkerExit, thread_cnt_, NULL);
     if (evhtp_bind_socket(htp_, address_.c_str(), port_, 1024) != 0) {
       return TRITONSERVER_ErrorNew(
           TRITONSERVER_ERROR_UNAVAILABLE,
@@ -4220,6 +4223,117 @@ DeferHandoff(
   return false;
 }
 
+//
+// Per-worker reply batching.
+//
+// evhtp drains its command pipe one command per event-loop dispatch, so
+// deferring each reply individually costs a send()/recv() pair per reply and
+// lets a reply burst overflow the pipe. Replies are instead queued per worker
+// and a single drain command is deferred per batch, which is what keeps the
+// pipe far from full in the first place. The retry above remains the backstop
+// for that (now much rarer) drain hand-off.
+//
+struct PendingReply {
+  evthr_cb cb;
+  void* arg;
+};
+
+using ReplyQueue = WorkerQueue<PendingReply>;
+
+void DrainReplies(evthr_t* thread, void* arg, void* shared);
+
+// Attached to each worker by WorkerInit and owned by the evthr thread.
+ReplyQueue*
+WorkerReplyQueue(evthr_t* thread)
+{
+  return (thread == nullptr) ? nullptr
+                             : static_cast<ReplyQueue*>(evthr_get_aux(thread));
+}
+
+void
+WorkerInit(evhtp_t* htp, evthr_t* thread, void* arg)
+{
+  evthr_set_aux(thread, new ReplyQueue());
+}
+
+void
+WorkerExit(evhtp_t* htp, evthr_t* thread, void* arg)
+{
+  ReplyQueue* queue = WorkerReplyQueue(thread);
+  if (queue == nullptr) {
+    return;
+  }
+  std::vector<PendingReply> pending;
+  queue->TakeAll(&pending);
+  if (!pending.empty()) {
+    // Reached only when the worker stops with replies still queued, i.e.
+    // during shutdown; the process is going away, so these are not reported
+    // as leaks.
+    LOG_VERBOSE(1) << "HTTP worker exiting with " << pending.size()
+                   << " undelivered reply hand-off(s)";
+  }
+  evthr_set_aux(thread, nullptr);
+  delete queue;
+}
+
+// Runs on the worker thread: delivers queued replies, yielding back to the
+// event loop between batches so this worker's other connections still make
+// progress.
+void
+DrainReplies(evthr_t* thread, void* arg, void* shared)
+{
+  ReplyQueue* queue = static_cast<ReplyQueue*>(arg);
+  std::vector<PendingReply> batch;
+  while (true) {
+    queue->TakeBatch(&batch);
+    for (const auto& pending : batch) {
+      pending.cb(thread, pending.arg, shared);
+    }
+    if (!queue->FinishBatch()) {
+      return;  // queue went idle
+    }
+    // More work remains. Prefer to yield to the event loop; if that hand-off
+    // cannot be scheduled we simply keep draining inline - we are already on
+    // the worker thread, so nothing can be stranded by the failure.
+    if (DeferHandoff(
+            thread, DrainReplies, queue, "DrainReplies", nullptr /* server */,
+            "" /* model_name */, -1 /* model_version */)) {
+      return;
+    }
+  }
+}
+
+// Queue a reply for 'thread' and, if no drain is pending for that worker,
+// schedule one. Returns false only when the drain could not be scheduled at
+// all, which is the case the caller must treat as a dropped hand-off.
+bool
+EnqueueHandoff(
+    evthr_t* thread, evthr_cb callback, void* arg, const char* site,
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version)
+{
+  ReplyQueue* queue = WorkerReplyQueue(thread);
+  if (queue == nullptr) {
+    // Worker was not initialized by us; fall back to deferring directly.
+    return DeferHandoff(
+        thread, callback, arg, site, server, model_name, model_version);
+  }
+  if (!queue->Enqueue(PendingReply{callback, arg})) {
+    return true;  // a drain is already scheduled for this worker
+  }
+  if (DeferHandoff(
+          thread, DrainReplies, queue, site, server, model_name,
+          model_version)) {
+    return true;
+  }
+  // Nothing will drain this worker until something re-arms it. Items queued
+  // behind this one by other requests are attributed only when their own
+  // producers next fail to arm; the drop log and the leak report above are
+  // the operator-facing signal either way.
+  queue->Disarm();
+  return false;
+}
+
 }  // namespace
 
 void
@@ -4313,7 +4427,7 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
     return;
   }
-  DeferHandoff(
+  EnqueueHandoff(
       infer_request->thread_, InferRequestClass::ReplyCallback, infer_request,
       "ReplyCallback", infer_request->server_, infer_request->leak_model_name_,
       infer_request->leak_model_version_);
@@ -4666,7 +4780,7 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
   // so user should check response body in case of error at later time.
   if (infer_request->IncrementResponseCount() == 0) {
     infer_request->response_code_ = HttpCodeFromError(err);
-    if (!DeferHandoff(
+    if (!EnqueueHandoff(
             infer_request->thread_, StartResponse, infer_request,
             "StartResponse", infer_request->server_,
             infer_request->leak_model_name_,
@@ -4687,7 +4801,7 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
     // A hand-off for this stream was already dropped and the request is
     // leaked; don't pump further callbacks into the broken stream.
   } else if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
-    if (!DeferHandoff(
+    if (!EnqueueHandoff(
             infer_request->thread_, EndResponseCallback, infer_request,
             "EndResponseCallback", infer_request->server_,
             infer_request->leak_model_name_,
@@ -4695,7 +4809,7 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
       infer_request->handoff_failed_ = true;
     }
   } else {
-    if (!DeferHandoff(
+    if (!EnqueueHandoff(
             infer_request->thread_, ChunkResponseCallback, infer_request,
             "ChunkResponseCallback", infer_request->server_,
             infer_request->leak_model_name_,
