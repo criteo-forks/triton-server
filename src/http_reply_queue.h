@@ -35,6 +35,21 @@
 
 namespace triton { namespace server {
 
+// Defaults shared by WorkerQueue and the env-var plumbing that tunes it.
+struct ReplyQueueDefaults {
+  static constexpr size_t kMaxBatch = 256;
+  // The old bound was the 208KiB socketpair over 17-byte commands (~12500
+  // in-flight hand-offs); keep the same order of magnitude by default.
+  static constexpr size_t kMaxDepth = 12500;
+};
+
+// Result of WorkerQueue::Enqueue().
+enum class EnqueueResult {
+  kArm,       // queued, and the caller must schedule a drain (queue was idle)
+  kQueued,    // queued behind a drain that is already scheduled or running
+  kRejected,  // depth cap reached: NOT queued, caller must drop-and-report
+};
+
 // Per-worker hand-off queue, deliberately free of evhtp/logging dependencies
 // so it is unit testable; http_server.cc owns the scheduling around it.
 //
@@ -47,39 +62,46 @@ namespace triton { namespace server {
 //
 // Scheduling protocol, which is what makes wake-ups neither lost nor
 // duplicated: 'armed_' means "a drain is scheduled or running for this
-// worker". It is set only by Enqueue() and cleared only by FinishBatch(),
-// both under 'mu_', and FinishBatch() refuses to clear it while items
-// remain. So a queue is never left non-empty with no drain pending.
+// worker". It is set only by Enqueue() and cleared only by FinishBatch()
+// (when empty) or TakeAll() (which empties), all under 'mu_'. So the queue
+// is never non-empty with no drain pending, and conversely a non-empty
+// queue is always armed.
+//
+// The depth cap stands in for the bound the old command pipe imposed: an
+// unbounded queue would let a stalled worker accumulate replies (each
+// holding model references) invisibly and forever. At the cap, Enqueue()
+// rejects and the caller reports the drop, restoring the pre-batching
+// pipe-full semantics.
 template <typename Item>
 class WorkerQueue {
  public:
-  static constexpr size_t kDefaultMaxBatch = 256;
+  static constexpr size_t kDefaultMaxBatch = ReplyQueueDefaults::kMaxBatch;
+  static constexpr size_t kDefaultMaxDepth = ReplyQueueDefaults::kMaxDepth;
 
-  explicit WorkerQueue(const size_t max_batch = kDefaultMaxBatch)
-      : max_batch_(std::max<size_t>(max_batch, 1))
+  explicit WorkerQueue(
+      const size_t max_batch = kDefaultMaxBatch,
+      const size_t max_depth = kDefaultMaxDepth)
+      : max_batch_(std::max<size_t>(max_batch, 1)),
+        max_depth_(std::max<size_t>(max_depth, 1))
   {
   }
 
-  // Append 'item'. Returns true if the caller must schedule a drain because
-  // the queue was idle; false if a drain is already pending, in which case
-  // the caller does nothing further.
-  bool Enqueue(Item item)
+  // Append 'item' unless the depth cap is reached. kArm means the queue was
+  // idle and the caller must schedule a drain; kQueued means a drain is
+  // already pending; kRejected means the item was NOT queued and the caller
+  // must treat it as a dropped hand-off.
+  EnqueueResult Enqueue(Item item)
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (items_.size() >= max_depth_) {
+      return EnqueueResult::kRejected;
+    }
     items_.push_back(std::move(item));
     if (armed_) {
-      return false;
+      return EnqueueResult::kQueued;
     }
     armed_ = true;
-    return true;
-  }
-
-  // Scheduling a drain failed: let the next Enqueue() try to schedule again.
-  // The queued items stay queued.
-  void Disarm()
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    armed_ = false;
+    return EnqueueResult::kArm;
   }
 
   // Move up to max_batch() items into 'out' (cleared first). The batch cap
@@ -110,8 +132,10 @@ class WorkerQueue {
     return false;
   }
 
-  // Move every queued item into 'out' (cleared first) and disarm, for
-  // shutdown accounting.
+  // Move every queued item into 'out' (cleared first) and disarm, in one
+  // critical section. Used when the drain could not be scheduled (the taken
+  // items must then be reported as dropped, since nothing will deliver
+  // them) and on worker shutdown.
   void TakeAll(std::vector<Item>* out)
   {
     out->clear();
@@ -137,12 +161,14 @@ class WorkerQueue {
   }
 
   size_t MaxBatch() const { return max_batch_; }
+  size_t MaxDepth() const { return max_depth_; }
 
  private:
   mutable std::mutex mu_;
   std::deque<Item> items_;
   bool armed_{false};
   const size_t max_batch_;
+  const size_t max_depth_;
 };
 
 }}  // namespace triton::server

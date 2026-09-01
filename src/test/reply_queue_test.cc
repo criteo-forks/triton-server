@@ -34,6 +34,7 @@
 
 namespace {
 
+using triton::server::EnqueueResult;
 using triton::server::WorkerQueue;
 
 using IntQueue = WorkerQueue<int>;
@@ -42,11 +43,11 @@ TEST(WorkerQueueTest, FirstEnqueueArmsAndFurtherOnesDoNot)
 {
   IntQueue queue;
   EXPECT_FALSE(queue.Armed());
-  EXPECT_TRUE(queue.Enqueue(1));
+  EXPECT_EQ(queue.Enqueue(1), EnqueueResult::kArm);
   EXPECT_TRUE(queue.Armed());
   // A drain is already pending, so these must not schedule another one.
-  EXPECT_FALSE(queue.Enqueue(2));
-  EXPECT_FALSE(queue.Enqueue(3));
+  EXPECT_EQ(queue.Enqueue(2), EnqueueResult::kQueued);
+  EXPECT_EQ(queue.Enqueue(3), EnqueueResult::kQueued);
   EXPECT_EQ(queue.Depth(), 3u);
 }
 
@@ -99,7 +100,7 @@ TEST(WorkerQueueTest, FinishBatchDisarmsWhenDrained)
   EXPECT_FALSE(queue.FinishBatch());
   EXPECT_FALSE(queue.Armed());
   // Having gone idle, the next enqueue must schedule a fresh drain.
-  EXPECT_TRUE(queue.Enqueue(2));
+  EXPECT_EQ(queue.Enqueue(2), EnqueueResult::kArm);
 }
 
 TEST(WorkerQueueTest, FinishBatchStaysArmedWhenWorkArrivedDuringTheBatch)
@@ -110,21 +111,27 @@ TEST(WorkerQueueTest, FinishBatchStaysArmedWhenWorkArrivedDuringTheBatch)
   queue.TakeBatch(&batch);
   // Producer pushes while the drain is running: must not schedule a second
   // drain, and must not let the queue go idle with an item still in it.
-  EXPECT_FALSE(queue.Enqueue(2));
+  EXPECT_EQ(queue.Enqueue(2), EnqueueResult::kQueued);
   EXPECT_TRUE(queue.FinishBatch());
   EXPECT_TRUE(queue.Armed());
   EXPECT_EQ(queue.Depth(), 1u);
 }
 
-TEST(WorkerQueueTest, DisarmAllowsReschedulingAndKeepsItems)
+TEST(WorkerQueueTest, TakeAllAfterFailedArmAllowsRearm)
 {
   IntQueue queue;
-  EXPECT_TRUE(queue.Enqueue(1));
-  queue.Disarm();  // scheduling the drain failed
+  EXPECT_EQ(queue.Enqueue(1), EnqueueResult::kArm);
+  EXPECT_EQ(queue.Enqueue(2), EnqueueResult::kQueued);
+  // Scheduling the drain failed: everything queued is stranded and must be
+  // taken out (and reported by the caller) in one atomic step, so nothing
+  // can be delivered later and contradict the report.
+  std::vector<int> stranded;
+  queue.TakeAll(&stranded);
+  EXPECT_EQ(stranded.size(), 2u);
+  EXPECT_EQ(queue.Depth(), 0u);
   EXPECT_FALSE(queue.Armed());
-  EXPECT_EQ(queue.Depth(), 1u);
-  EXPECT_TRUE(queue.Enqueue(2));  // next producer re-arms
-  EXPECT_EQ(queue.Depth(), 2u);
+  // The next producer starts a fresh arm attempt.
+  EXPECT_EQ(queue.Enqueue(3), EnqueueResult::kArm);
 }
 
 TEST(WorkerQueueTest, TakeAllDrainsAndDisarms)
@@ -140,12 +147,32 @@ TEST(WorkerQueueTest, TakeAllDrainsAndDisarms)
   EXPECT_FALSE(queue.Armed());
 }
 
-TEST(WorkerQueueTest, MaxBatchIsAtLeastOne)
+TEST(WorkerQueueTest, DepthCapRejectsWithoutQueueing)
 {
-  IntQueue queue(0);
+  IntQueue queue(2 /* max_batch */, 3 /* max_depth */);
+  EXPECT_EQ(queue.Enqueue(0), EnqueueResult::kArm);
+  EXPECT_EQ(queue.Enqueue(1), EnqueueResult::kQueued);
+  EXPECT_EQ(queue.Enqueue(2), EnqueueResult::kQueued);
+  // At the cap: rejected, not queued, and the armed state is untouched (a
+  // non-empty queue is always armed, so a rejection never needs to arm).
+  EXPECT_EQ(queue.Enqueue(3), EnqueueResult::kRejected);
+  EXPECT_EQ(queue.Depth(), 3u);
+  EXPECT_TRUE(queue.Armed());
+  // Draining below the cap admits producers again.
+  std::vector<int> batch;
+  queue.TakeBatch(&batch);
+  EXPECT_EQ(batch.size(), 2u);
+  EXPECT_EQ(queue.Enqueue(4), EnqueueResult::kQueued);
+  EXPECT_EQ(queue.Depth(), 2u);
+}
+
+TEST(WorkerQueueTest, MaxBatchAndDepthAreAtLeastOne)
+{
+  IntQueue queue(0, 0);
   EXPECT_EQ(queue.MaxBatch(), 1u);
-  queue.Enqueue(1);
-  queue.Enqueue(2);
+  EXPECT_EQ(queue.MaxDepth(), 1u);
+  EXPECT_EQ(queue.Enqueue(1), EnqueueResult::kArm);
+  EXPECT_EQ(queue.Enqueue(2), EnqueueResult::kRejected);
   std::vector<int> batch;
   queue.TakeBatch(&batch);
   EXPECT_EQ(batch.size(), 1u);
@@ -159,10 +186,9 @@ TEST(WorkerQueueTest, ConcurrentProducersNeverStrandItems)
 {
   constexpr int kProducers = 8;
   constexpr int kPerProducer = 2000;
-  IntQueue queue(64);
+  IntQueue queue(64, 1u << 20 /* effectively uncapped for this test */);
   std::atomic<int> arm_requests{0};
   std::atomic<int> delivered{0};
-  std::atomic<bool> draining{false};
 
   auto drain = [&]() {
     std::vector<int> batch;
@@ -179,12 +205,10 @@ TEST(WorkerQueueTest, ConcurrentProducersNeverStrandItems)
   for (int p = 0; p < kProducers; ++p) {
     producers.emplace_back([&]() {
       for (int i = 0; i < kPerProducer; ++i) {
-        if (queue.Enqueue(i)) {
+        if (queue.Enqueue(i) == EnqueueResult::kArm) {
           ++arm_requests;
           // Stand in for the worker thread picking the drain command up.
-          draining = true;
           drain();
-          draining = false;
         }
       }
     });
