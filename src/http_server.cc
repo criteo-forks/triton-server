@@ -35,12 +35,16 @@
 #include <re2/re2.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <list>
 #include <regex>
 #include <thread>
 
 #include "classification.h"
+#include "http_reply_handoff.h"
+#include "http_reply_queue.h"
 
 #define TRITONJSON_STATUSTYPE TRITONSERVER_Error*
 #define TRITONJSON_STATUSRETURN(M) \
@@ -54,6 +58,16 @@ namespace triton { namespace server {
 // thread). Increment in ChunkCountIncrement. Caps evbuffer fan-out / RSS.
 constexpr uint64_t kMaxChunkedChunks =
     1 << 16;  // reject on chunk count > kMaxChunkedChunks (65536)
+
+namespace {
+// Defined with the reply hand-off machinery further below.
+int64_t DeferRetryBudgetMs();
+size_t ReplyBatchMax();
+size_t ReplyQueueMax();
+void InitHandoffTelemetry();
+void WorkerInit(evhtp_t* htp, evthr_t* thread, void* arg);
+void WorkerExit(evhtp_t* htp, evthr_t* thread, void* arg);
+}  // namespace
 
 #define RETURN_AND_CALLBACK_IF_ERR(X, CALLBACK) \
   do {                                          \
@@ -216,7 +230,7 @@ HTTPServer::Start()
     }
     evhtp_set_gencb(htp_, HTTPServer::Dispatch, this);
     evhtp_set_pre_accept_cb(htp_, HTTPServer::NewConnection, this);
-    evhtp_use_threads_wexit(htp_, NULL, NULL, thread_cnt_, NULL);
+    evhtp_use_threads_wexit(htp_, WorkerInit, WorkerExit, thread_cnt_, NULL);
     if (evhtp_bind_socket(htp_, address_.c_str(), port_, 1024) != 0) {
       return TRITONSERVER_ErrorNew(
           TRITONSERVER_ERROR_UNAVAILABLE,
@@ -1191,6 +1205,16 @@ HTTPAPIServer::HTTPAPIServer(
       trace_regex_(R"(/v2/trace/setting)"), max_input_size_(max_input_size),
       restricted_apis_(restricted_apis)
 {
+  // Parse and log the reply hand-off tunables now so an invalid
+  // TRITON_HTTP_DEFER_RETRY_BUDGET_MS / TRITON_HTTP_REPLY_BATCH_MAX /
+  // TRITON_HTTP_REPLY_QUEUE_MAX surfaces at startup, not mid-traffic; and
+  // register the hand-off metrics so they are exported as 0 from startup
+  // instead of appearing only after the first reply.
+  DeferRetryBudgetMs();
+  ReplyBatchMax();
+  ReplyQueueMax();
+  InitHandoffTelemetry();
+
   // FIXME, don't cache server metadata. The http endpoint should
   // not be deciding that server metadata will not change during
   // execution.
@@ -3994,6 +4018,544 @@ HTTPAPIServer::InferRequestClass::InferRequestClass(
       reinterpret_cast<void*>(this));
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Reply hand-off hardening.
+//
+// Every HTTP request is paused in InferRequestClass's constructor and resumed
+// only by a callback deferred to its connection's worker thread. A dropped
+// hand-off (worker command socketpair full -> EVTHR_RES_RETRY <- EAGAIN under
+// reply bursts) leaves the connection paused with no armed events: the
+// request is never finalized, its model references leak, and the model's
+// next unload wedges in UNLOADING holding GPU memory until pod restart.
+// ---------------------------------------------------------------------------
+
+// Retry budget for a blocked hand-off, tunable per pod without a rebuild.
+// 0 disables retries, restoring the drop-and-log behavior (A/B positive
+// control on the same image).
+int64_t
+DeferRetryBudgetMs()
+{
+  static const int64_t budget_ms = [] {
+    int64_t ms = 3000;
+    const char* env = std::getenv("TRITON_HTTP_DEFER_RETRY_BUDGET_MS");
+    if (env != nullptr) {
+      char* end = nullptr;
+      const long long parsed = std::strtoll(env, &end, 10);
+      if ((end != env) && (*end == '\0') && (parsed >= 0)) {
+        ms = parsed;
+      } else {
+        LOG_ERROR << "ignoring invalid TRITON_HTTP_DEFER_RETRY_BUDGET_MS='"
+                  << env << "', using " << ms << "ms";
+      }
+    }
+    LOG_INFO << "HTTP reply hand-off retry budget: " << ms << "ms"
+             << ((ms == 0) ? " (retries disabled)" : "");
+    return ms;
+  }();
+  return budget_ms;
+}
+
+// Shared parser for the positive-integer reply-queue tunables.
+size_t
+PositiveSizeFromEnv(const char* name, const size_t fallback)
+{
+  size_t value = fallback;
+  const char* env = std::getenv(name);
+  if (env != nullptr) {
+    char* end = nullptr;
+    const long long parsed = std::strtoll(env, &end, 10);
+    if ((end != env) && (*end == '\0') && (parsed > 0)) {
+      value = static_cast<size_t>(parsed);
+    } else {
+      LOG_ERROR << "ignoring invalid " << name << "='" << env << "', using "
+                << fallback;
+    }
+  }
+  LOG_INFO << "HTTP reply " << name << ": " << value;
+  return value;
+}
+
+// Most replies a single drain delivers before yielding back to the event
+// loop, bounding how long one worker's backlog can starve its other
+// connections.
+size_t
+ReplyBatchMax()
+{
+  static const size_t batch_max = PositiveSizeFromEnv(
+      "TRITON_HTTP_REPLY_BATCH_MAX", ReplyQueueDefaults::kMaxBatch);
+  return batch_max;
+}
+
+// Depth cap per worker reply queue; at the cap further hand-offs are dropped
+// and reported, mirroring the bound the command pipe itself used to impose.
+size_t
+ReplyQueueMax()
+{
+  static const size_t queue_max = PositiveSizeFromEnv(
+      "TRITON_HTTP_REPLY_QUEUE_MAX", ReplyQueueDefaults::kMaxDepth);
+  return queue_max;
+}
+
+// Hand-off retry/drop accounting, exported on the metrics endpoint so fleets
+// can alert on pods that will leak (drops) or run hot (retries). Also tracks
+// per-worker consecutive budget exhaustions: a worker whose command pipe
+// stays full through several whole budgets is dead or wedged, and sleeping
+// on it only stalls completion threads.
+class DeferTelemetry {
+ public:
+  static DeferTelemetry& Get()
+  {
+    // Deliberately leaked: metric families live for the process lifetime.
+    static DeferTelemetry singleton;
+    return singleton;
+  }
+
+  void RecordRetriedSuccess(const char* site, int64_t waited_us)
+  {
+    const uint64_t n = ++retried_;
+#ifdef TRITON_ENABLE_METRICS
+    if (retried_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(retried_metric_, 1),
+          "incrementing retried hand-off metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+    // First occurrence, every 100th, and any unusually long wait: enough to
+    // see congestion in logs without flooding them.
+    if ((n == 1) || ((n % 100) == 0) || (waited_us > 100000)) {
+      LOG_INFO << "FULL-SOCKETS: " << site << " hand-off delivered after "
+               << (waited_us / 1000.0)
+               << "ms of retries (retried hand-offs: " << n
+               << "): worker command pipe filled under reply burst";
+    }
+  }
+
+  void RecordDrop(const char* site, evthr_t* thread, const char* cause)
+  {
+    const uint64_t n = ++dropped_;
+#ifdef TRITON_ENABLE_METRICS
+    if (dropped_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(dropped_metric_, 1),
+          "incrementing dropped hand-off metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+    LOG_ERROR << "FULL-SOCKETS: " << site << " hand-off DROPPED (total " << n
+              << ", worker " << thread << ", " << cause
+              << "): this request's connection stays paused and its model "
+                 "references leak; that model's next unload will wedge in "
+                 "UNLOADING and hold its GPU memory. Restart this pod at the "
+                 "next opportunity.";
+  }
+
+  // One queued reply entered a worker queue (depth gauge +1).
+  void RecordQueued()
+  {
+#ifdef TRITON_ENABLE_METRICS
+    if (depth_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(depth_metric_, 1),
+          "incrementing reply queue depth metric");
+    }
+#endif  // TRITON_ENABLE_METRICS
+  }
+
+  // One batch of 'delivered' replies was drained; batched/batches gives the
+  // average batch size, the direct measure of whether batching is engaging.
+  void RecordBatchDrained(const size_t delivered)
+  {
+#ifdef TRITON_ENABLE_METRICS
+    if (batches_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(batches_metric_, 1),
+          "incrementing reply batches metric");
+    }
+    if (batched_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(
+              batched_metric_, static_cast<double>(delivered)),
+          "incrementing batched replies metric");
+    }
+    RecordUnqueued(delivered);
+#else
+    (void)delivered;
+#endif  // TRITON_ENABLE_METRICS
+  }
+
+  // 'count' replies left a worker queue without being drained (stranded or
+  // worker shutdown), or as part of a drained batch (depth gauge -count).
+  void RecordUnqueued(const size_t count)
+  {
+#ifdef TRITON_ENABLE_METRICS
+    if ((depth_metric_ != nullptr) && (count > 0)) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricIncrement(
+              depth_metric_, -static_cast<double>(count)),
+          "decrementing reply queue depth metric");
+    }
+#else
+    (void)count;
+#endif  // TRITON_ENABLE_METRICS
+  }
+
+  bool WorkerCircuitOpen(evthr_t* thread) { return circuit_.Open(thread); }
+
+  void RecordWorkerOk(evthr_t* thread) { circuit_.Ok(thread); }
+
+  void RecordWorkerExhausted(evthr_t* thread)
+  {
+    const int n = circuit_.Exhausted(thread);
+    if (n == circuit_.Threshold()) {
+      LOG_ERROR << "FULL-SOCKETS: worker " << thread << " exhausted " << n
+                << " consecutive retry budgets - presuming it dead and "
+                   "failing its hand-offs fast from now on (a successful "
+                   "hand-off re-arms retries)";
+    }
+  }
+
+ private:
+  DeferTelemetry()
+  {
+#ifdef TRITON_ENABLE_METRICS
+    auto create = [](const TRITONSERVER_MetricKind kind, const char* name,
+                     const char* description,
+                     TRITONSERVER_MetricFamily** family,
+                     TRITONSERVER_Metric** metric) {
+      TRITONSERVER_Error* err =
+          TRITONSERVER_MetricFamilyNew(family, kind, name, description);
+      if (err == nullptr) {
+        err = TRITONSERVER_MetricNew(metric, *family, nullptr /* labels */, 0);
+      }
+      if (err != nullptr) {
+        LOG_ERROR << "failed to register " << name
+                  << " metric: " << TRITONSERVER_ErrorMessage(err);
+        TRITONSERVER_ErrorDelete(err);
+      }
+    };
+    create(
+        TRITONSERVER_METRIC_KIND_COUNTER, "nv_http_reply_handoff_retried",
+        "Number of HTTP reply hand-offs delivered only after retrying a full "
+        "worker command pipe",
+        &retried_family_, &retried_metric_);
+    create(
+        TRITONSERVER_METRIC_KIND_COUNTER, "nv_http_reply_handoff_dropped",
+        "Number of HTTP reply hand-offs dropped after exhausting the retry "
+        "budget; each leaks model references until pod restart",
+        &dropped_family_, &dropped_metric_);
+    create(
+        TRITONSERVER_METRIC_KIND_COUNTER, "nv_http_reply_batches",
+        "Number of reply batches drained through a single worker pipe "
+        "command; nv_http_reply_batched over this is the average batch size",
+        &batches_family_, &batches_metric_);
+    create(
+        TRITONSERVER_METRIC_KIND_COUNTER, "nv_http_reply_batched",
+        "Number of HTTP replies delivered through batched drains",
+        &batched_family_, &batched_metric_);
+    create(
+        TRITONSERVER_METRIC_KIND_GAUGE, "nv_http_reply_queue_depth",
+        "HTTP replies currently queued for delivery across workers; sustained "
+        "growth means a worker is stalled",
+        &depth_family_, &depth_metric_);
+#endif  // TRITON_ENABLE_METRICS
+  }
+
+  std::atomic<uint64_t> retried_{0};
+  std::atomic<uint64_t> dropped_{0};
+  WorkerCircuit circuit_;
+#ifdef TRITON_ENABLE_METRICS
+  TRITONSERVER_MetricFamily* retried_family_ = nullptr;
+  TRITONSERVER_Metric* retried_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* dropped_family_ = nullptr;
+  TRITONSERVER_Metric* dropped_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* batches_family_ = nullptr;
+  TRITONSERVER_Metric* batches_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* batched_family_ = nullptr;
+  TRITONSERVER_Metric* batched_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* depth_family_ = nullptr;
+  TRITONSERVER_Metric* depth_metric_ = nullptr;
+#endif  // TRITON_ENABLE_METRICS
+};
+
+// Touch the telemetry singleton at server construction so its metric
+// families exist (as zeros) from startup rather than materializing on the
+// first hand-off - an absent counter is indistinguishable from a broken one.
+void
+InitHandoffTelemetry()
+{
+  (void)DeferTelemetry::Get();
+}
+
+// Attribute a dropped hand-off's leaked reference to its model in the core
+// repository index (best-effort; a failure only loses the annotation).
+void
+ReportLeakedModelReference(
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version)
+{
+  if ((server == nullptr) || model_name.empty() || (model_version < 0)) {
+    return;
+  }
+  TRITONSERVER_Error* err = TRITONSERVER_ServerModelReportLeakedReference(
+      server, model_name.c_str(), model_version);
+  if (err != nullptr) {
+    LOG_ERROR << "failed to report leaked reference for model '" << model_name
+              << "' version " << model_version << ": "
+              << TRITONSERVER_ErrorMessage(err);
+    TRITONSERVER_ErrorDelete(err);
+  }
+}
+
+// Hand 'callback' to the connection's worker thread via RetryDefer (see
+// http_reply_handoff.h), recording telemetry; if the hand-off is ultimately
+// dropped, attribute the leaked request to 'model_name'/'model_version' in
+// the repository index. Returns true when delivered.
+//
+// Blocking this (completion) thread is deliberate: a request's hand-offs
+// (StartResponse -> Chunk... -> End) must reach the worker in order, and a
+// deferred retry queue would reorder them unless serialized per request.
+// The pipe drains as soon as the worker runs, so real retries clear in
+// microseconds; the circuit breaker bounds the dead-worker case.
+// 'defer_fn' is injectable for tests.
+// Circuit-gated retrying defer with success telemetry; failure REPORTING is
+// the caller's job, because only the caller knows what a failure strands
+// (one reply, or a whole queue of them).
+evthr_res
+TryHandoff(
+    evthr_t* thread, evthr_cb callback, void* arg, const char* site,
+    DeferFn defer_fn = evthr_defer)
+{
+  auto& telemetry = DeferTelemetry::Get();
+  const int64_t budget_ms =
+      telemetry.WorkerCircuitOpen(thread) ? 0 : DeferRetryBudgetMs();
+  int64_t waited_us = 0;
+  const evthr_res res =
+      RetryDefer(thread, callback, arg, budget_ms, defer_fn, &waited_us);
+  if (res == EVTHR_RES_OK) {
+    telemetry.RecordWorkerOk(thread);
+    if (waited_us > 0) {
+      telemetry.RecordRetriedSuccess(site, waited_us);
+    }
+  } else if ((res == EVTHR_RES_RETRY) && (budget_ms > 0)) {
+    telemetry.RecordWorkerExhausted(thread);
+  }
+  return res;
+}
+
+bool
+DeferHandoff(
+    evthr_t* thread, evthr_cb callback, void* arg, const char* site,
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version, DeferFn defer_fn = evthr_defer)
+{
+  const evthr_res res = TryHandoff(thread, callback, arg, site, defer_fn);
+  if (res == EVTHR_RES_OK) {
+    return true;
+  }
+  if (res == EVTHR_RES_RETRY) {
+    DeferTelemetry::Get().RecordDrop(
+        site, thread, "worker command pipe stayed full through the budget");
+    ReportLeakedModelReference(server, model_name, model_version);
+    return false;
+  }
+  // EVTHR_RES_FATAL or unknown: not a queue-full drop (typically server
+  // shutdown or invalid arguments) - don't attribute a leak that may not be
+  // real, since a report cannot be retracted.
+  LOG_ERROR << "FULL-SOCKETS: " << site
+            << " hand-off failed (evthr_defer=" << res
+            << ", non-retryable); request will not complete";
+  return false;
+}
+
+//
+// Per-worker reply batching.
+//
+// evhtp drains its command pipe one command per event-loop dispatch, so
+// deferring each reply individually costs a send()/recv() pair per reply and
+// lets a reply burst overflow the pipe. Replies are instead queued per worker
+// and a single drain command is deferred per batch, which is what keeps the
+// pipe far from full in the first place. The retry above remains the backstop
+// for that (now much rarer) drain hand-off.
+//
+// A queued reply carries its own drop-attribution identity: stranded items
+// are reported after their producers' stack frames are gone, so a reference
+// to the caller's model name would dangle. The std::string copy per reply is
+// the price of exact per-item attribution.
+struct PendingReply {
+  evthr_cb cb;
+  void* arg;
+  const char* site;             // call-site tag (string literal)
+  TRITONSERVER_Server* server;  // for leak attribution if dropped
+  std::string model_name;
+  int64_t model_version;
+};
+
+using ReplyQueue = WorkerQueue<PendingReply>;
+
+void DrainReplies(evthr_t* thread, void* arg, void* shared);
+
+// Attached to each worker by WorkerInit and owned by the evthr thread.
+ReplyQueue*
+WorkerReplyQueue(evthr_t* thread)
+{
+  return (thread == nullptr) ? nullptr
+                             : static_cast<ReplyQueue*>(evthr_get_aux(thread));
+}
+
+void
+WorkerInit(evhtp_t* htp, evthr_t* thread, void* arg)
+{
+  evthr_set_aux(thread, new ReplyQueue(ReplyBatchMax(), ReplyQueueMax()));
+}
+
+void
+WorkerExit(evhtp_t* htp, evthr_t* thread, void* arg)
+{
+  ReplyQueue* queue = WorkerReplyQueue(thread);
+  if (queue == nullptr) {
+    return;
+  }
+  std::vector<PendingReply> pending;
+  queue->TakeAll(&pending);
+  if (!pending.empty()) {
+    // Reached only when the worker stops with replies still queued, i.e.
+    // during shutdown; the process is going away, so these are not reported
+    // as leaks.
+    DeferTelemetry::Get().RecordUnqueued(pending.size());
+    LOG_VERBOSE(1) << "HTTP worker exiting with " << pending.size()
+                   << " undelivered reply hand-off(s)";
+  }
+  evthr_set_aux(thread, nullptr);
+  delete queue;
+}
+
+// Runs on the worker thread: delivers queued replies, yielding back to the
+// event loop between batches so this worker's other connections still make
+// progress.
+void
+DrainReplies(evthr_t* thread, void* arg, void* shared)
+{
+  ReplyQueue* queue = static_cast<ReplyQueue*>(arg);
+  auto& telemetry = DeferTelemetry::Get();
+  std::vector<PendingReply> batch;
+  while (true) {
+    queue->TakeBatch(&batch);
+    if (!batch.empty()) {
+      telemetry.RecordBatchDrained(batch.size());
+    }
+    for (const auto& pending : batch) {
+      // A throwing callback must not skip the rest of the batch (those
+      // replies were already taken out of the queue and would vanish
+      // unreported) or unwind past FinishBatch (which would leave the queue
+      // armed forever, silently wedging every later reply on this worker).
+      try {
+        pending.cb(thread, pending.arg, shared);
+      }
+      catch (const std::exception& ex) {
+        LOG_ERROR << "FULL-SOCKETS: " << pending.site
+                  << " reply callback threw: " << ex.what()
+                  << "; abandoning that request and continuing the drain";
+      }
+      catch (...) {
+        LOG_ERROR << "FULL-SOCKETS: " << pending.site
+                  << " reply callback threw a non-exception; abandoning that "
+                     "request and continuing the drain";
+      }
+    }
+    if (!queue->FinishBatch()) {
+      return;  // queue went idle
+    }
+    // More work remains. Prefer to yield to the event loop so this worker's
+    // other connections make progress - but with a single non-sleeping
+    // attempt and no drop telemetry: we are already on the worker thread, so
+    // a full pipe just means we keep draining inline. Going through the
+    // retrying DeferHandoff here would sleep with replies waiting and count
+    // a "drop" that never happens.
+    if (evthr_defer(thread, DrainReplies, queue) == EVTHR_RES_OK) {
+      return;
+    }
+  }
+}
+
+// Queue a reply for 'thread' and, if no drain is pending for that worker,
+// schedule one. Returns false when the reply will never be delivered - it
+// was rejected at the depth cap, or the drain could not be scheduled - and
+// every undeliverable reply (this one and any stranded behind a failed
+// drain) has then already been reported against its own model.
+bool
+EnqueueHandoff(
+    evthr_t* thread, evthr_cb callback, void* arg, const char* site,
+    TRITONSERVER_Server* server, const std::string& model_name,
+    const int64_t model_version)
+{
+  ReplyQueue* queue = WorkerReplyQueue(thread);
+  if (queue == nullptr) {
+    // Worker was not initialized by us; fall back to deferring directly.
+    return DeferHandoff(
+        thread, callback, arg, site, server, model_name, model_version);
+  }
+  auto& telemetry = DeferTelemetry::Get();
+  const EnqueueResult enq = queue->Enqueue(
+      PendingReply{callback, arg, site, server, model_name, model_version});
+  if (enq == EnqueueResult::kRejected) {
+    // Only a worker stalled long enough to accumulate a full pipe's worth of
+    // backlog reaches the cap; same drop-and-report semantics as the old
+    // pipe-full condition.
+    telemetry.RecordDrop(site, thread, "worker reply queue at depth cap");
+    ReportLeakedModelReference(server, model_name, model_version);
+    return false;
+  }
+  telemetry.RecordQueued();
+  if (enq == EnqueueResult::kQueued) {
+    return true;  // a drain is already scheduled for this worker
+  }
+  // This enqueue armed the queue: schedule its drain (the only per-batch
+  // pipe write; retry budget and circuit breaker apply).
+  if (TryHandoff(thread, DrainReplies, queue, site) == EVTHR_RES_OK) {
+    return true;
+  }
+  // The drain could not be scheduled, so nothing will deliver what is
+  // queued: take every stranded reply out (atomically disarming, so none of
+  // them can be delivered later and contradict the report) and report each
+  // against its own model, as the pre-batching per-reply drop did. A reply
+  // another producer queued in the meantime is taken and reported too - its
+  // delivery depended on this drain.
+  std::vector<PendingReply> stranded;
+  queue->TakeAll(&stranded);
+  telemetry.RecordUnqueued(stranded.size());
+  for (const auto& reply : stranded) {
+    telemetry.RecordDrop(
+        reply.site, thread, "drain hand-off exhausted the retry budget");
+    ReportLeakedModelReference(
+        reply.server, reply.model_name, reply.model_version);
+  }
+  return false;
+}
+
+}  // namespace
+
+void
+HTTPAPIServer::InferRequestClass::CaptureModelIdentity(
+    InferRequestClass* infer_request, TRITONSERVER_InferenceResponse* response)
+{
+  if (response == nullptr) {
+    return;
+  }
+  const char* model_name = nullptr;
+  int64_t model_version = -1;
+  TRITONSERVER_Error* err = TRITONSERVER_InferenceResponseModel(
+      response, &model_name, &model_version);
+  if (err != nullptr) {
+    TRITONSERVER_ErrorDelete(err);
+    return;
+  }
+  if (model_name != nullptr) {
+    infer_request->leak_model_name_ = model_name;
+    infer_request->leak_model_version_ = model_version;
+  }
+}
+
 void
 HTTPAPIServer::InferRequestClass::InferRequestComplete(
     TRITONSERVER_InferenceRequest* request, const uint32_t flags, void* userp)
@@ -4048,6 +4610,8 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   }
 
 
+  CaptureModelIdentity(infer_request, response);
+
   LOG_TRITONSERVER_ERROR(
       TRITONSERVER_InferenceResponseDelete(response),
       "deleting inference response");
@@ -4062,8 +4626,10 @@ HTTPAPIServer::InferRequestClass::InferResponseComplete(
   if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) == 0) {
     return;
   }
-  evthr_defer(
-      infer_request->thread_, InferRequestClass::ReplyCallback, infer_request);
+  EnqueueHandoff(
+      infer_request->thread_, InferRequestClass::ReplyCallback, infer_request,
+      "ReplyCallback", infer_request->server_, infer_request->leak_model_name_,
+      infer_request->leak_model_version_);
 }
 
 TRITONSERVER_Error*
@@ -4398,6 +4964,8 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 
   // Assuming responses of the same request is sent in sequence.
 
+  CaptureModelIdentity(infer_request, response);
+
   TRITONSERVER_Error* err = nullptr;
   if (response != nullptr) {
     err = infer_request->FinalizeResponse(response);
@@ -4411,7 +4979,13 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
   // so user should check response body in case of error at later time.
   if (infer_request->IncrementResponseCount() == 0) {
     infer_request->response_code_ = HttpCodeFromError(err);
-    evthr_defer(infer_request->thread_, StartResponse, infer_request);
+    if (!EnqueueHandoff(
+            infer_request->thread_, StartResponse, infer_request,
+            "StartResponse", infer_request->server_,
+            infer_request->leak_model_name_,
+            infer_request->leak_model_version_)) {
+      infer_request->handoff_failed_ = true;
+    }
   }
 
 #ifdef TRITON_ENABLE_TRACING
@@ -4422,10 +4996,25 @@ HTTPAPIServer::GenerateRequestClass::InferResponseComplete(
 #endif  // TRITON_ENABLE_TRACING
 
   // Final flag indicates there is no more responses, ending chunked response.
-  if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
-    evthr_defer(infer_request->thread_, EndResponseCallback, infer_request);
+  if (infer_request->handoff_failed_) {
+    // A hand-off for this stream was already dropped and the request is
+    // leaked; don't pump further callbacks into the broken stream.
+  } else if ((flags & TRITONSERVER_RESPONSE_COMPLETE_FINAL) != 0) {
+    if (!EnqueueHandoff(
+            infer_request->thread_, EndResponseCallback, infer_request,
+            "EndResponseCallback", infer_request->server_,
+            infer_request->leak_model_name_,
+            infer_request->leak_model_version_)) {
+      infer_request->handoff_failed_ = true;
+    }
   } else {
-    evthr_defer(infer_request->thread_, ChunkResponseCallback, infer_request);
+    if (!EnqueueHandoff(
+            infer_request->thread_, ChunkResponseCallback, infer_request,
+            "ChunkResponseCallback", infer_request->server_,
+            infer_request->leak_model_name_,
+            infer_request->leak_model_version_)) {
+      infer_request->handoff_failed_ = true;
+    }
   }
 
   LOG_TRITONSERVER_ERROR(

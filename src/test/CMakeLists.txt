@@ -137,3 +137,73 @@ if(${TRITON_ENABLE_GPU})
   add_subdirectory(sequence sequence)
   add_subdirectory(implicit_state implicit_state)
 endif()
+
+#
+# Reply hand-off retry / worker circuit-breaker unit tests
+#
+if(${TRITON_ENABLE_HTTP})
+  add_executable(
+    reply_handoff_test
+    reply_handoff_test.cc
+    ../http_reply_handoff.h
+  )
+  set_target_properties(
+    reply_handoff_test
+    PROPERTIES
+      SKIP_BUILD_RPATH TRUE
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH_USE_LINK_PATH FALSE
+      INSTALL_RPATH ""
+  )
+  target_include_directories(
+    reply_handoff_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/..
+      ${GTEST_INCLUDE_DIRS}
+      ${LIBEVENT_INCLUDE_DIRS}
+      $<TARGET_PROPERTY:libevhtp::evhtp,INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_link_libraries(
+    reply_handoff_test
+    PRIVATE
+      GTest::gtest
+  )
+  install(
+    TARGETS reply_handoff_test
+    RUNTIME DESTINATION bin
+  )
+endif()
+
+#
+# Per-worker reply batching queue unit tests
+#
+if(${TRITON_ENABLE_HTTP})
+  add_executable(
+    reply_queue_test
+    reply_queue_test.cc
+    ../http_reply_queue.h
+  )
+  set_target_properties(
+    reply_queue_test
+    PROPERTIES
+      SKIP_BUILD_RPATH TRUE
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH_USE_LINK_PATH FALSE
+      INSTALL_RPATH ""
+  )
+  target_include_directories(
+    reply_queue_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/..
+      ${GTEST_INCLUDE_DIRS}
+  )
+  target_link_libraries(
+    reply_queue_test
+    PRIVATE
+      GTest::gtest
+  )
+  install(
+    TARGETS reply_queue_test
+    RUNTIME DESTINATION bin
+  )
+endif()
