@@ -68,6 +68,34 @@ the KServe and extension documentation for details.
 ### HTTP Options
 Triton provides the following configuration options for server-client network transactions over HTTP protocol.
 
+#### HTTP Reply Hand-off Tuning
+
+Triton pauses each HTTP request on the completion thread and resumes it via a
+callback handed to its connection's worker thread over the worker command pipe.
+Under a reply burst the pipe can fill and the hand-off would be lost, leaking
+the request's model references and wedging the model's next unload. To prevent
+that, replies are batched per worker and a dropped hand-off is retried and
+accounted for. The following environment variables tune that machinery:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TRITON_HTTP_DEFER_RETRY_BUDGET_MS` | `3000` | Per-hand-off retry budget in ms before a reply is declared a leak. `0` disables retries (A/B control). |
+| `TRITON_HTTP_REPLY_BATCH_MAX` | `256` | Max replies a single worker drain delivers before yielding back to the event loop. |
+| `TRITON_HTTP_REPLY_QUEUE_MAX` | `12500` | Max queued replies per worker beyond which further hand-offs are dropped and reported, mirroring the old command-pipe bound. |
+| `TRITON_HTTP_REPLY_DRAIN_CMDS_MAX` | `1` | Max drain commands a worker may have outstanding in its command pipe. evhtp places new connections on the worker with the fewest pipe commands, so this bounds the load a busy worker advertises: `1` only distinguishes busy from idle, larger values (e.g. `10`) restore a backlog proportional to the reply rate while still keeping the pipe far from full. |
+
+Rejected or dropped hand-offs are reported on the metrics endpoint
+(`nv_http_reply_handoff_retried`, `nv_http_reply_handoff_dropped`,
+`nv_http_reply_batches`, `nv_http_reply_batched`, `nv_http_reply_queue_depth`)
+and in the `FULL-SOCKETS` log lines, so fleets can alert on pods that will
+leak and restart them before an unload wedges.
+
+Note that `nv_inference_request_duration_us` stops when the backend's response
+send returns, which for HTTP is the moment the reply is queued for its worker
+thread. The time a reply then waits for that worker is reported separately by
+the `nv_http_reply_handoff_wait_us` histogram; a growing tail there with normal
+request durations means the HTTP frontend, not inference, is adding latency.
+
 #### Compression
 
 Triton allows the on-wire compression of request/response on HTTP through its clients. See [HTTP Compression](../client/README.md#compression) for more details.

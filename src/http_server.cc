@@ -64,10 +64,23 @@ namespace {
 int64_t DeferRetryBudgetMs();
 size_t ReplyBatchMax();
 size_t ReplyQueueMax();
+size_t ReplyDrainCmdsMax();
 void InitHandoffTelemetry();
 void WorkerInit(evhtp_t* htp, evthr_t* thread, void* arg);
 void WorkerExit(evhtp_t* htp, evthr_t* thread, void* arg);
 }  // namespace
+
+// Upper bound on consecutive inline drain iterations before a drain yields back
+// to the event loop. The batch cap bounds one batch, but if the yield hand-off
+// keeps failing the current drain loops inline forever, monopolising the worker
+// and starving its other connections regardless of the batch size.
+constexpr int kMaxConsecutiveInlineDrains = 8;
+
+// Budget for the drain's backed-off yield. Deliberately short: this blocks the
+// worker thread (which must both run the event loop and drain), so we bound the
+// sleep tightly and let the pipe drain; the full defer budget is for completion
+// threads, which are cheaper to block.
+constexpr int64_t kDrainYieldBackoffMs = 100;
 
 #define RETURN_AND_CALLBACK_IF_ERR(X, CALLBACK) \
   do {                                          \
@@ -1207,12 +1220,13 @@ HTTPAPIServer::HTTPAPIServer(
 {
   // Parse and log the reply hand-off tunables now so an invalid
   // TRITON_HTTP_DEFER_RETRY_BUDGET_MS / TRITON_HTTP_REPLY_BATCH_MAX /
-  // TRITON_HTTP_REPLY_QUEUE_MAX surfaces at startup, not mid-traffic; and
-  // register the hand-off metrics so they are exported as 0 from startup
-  // instead of appearing only after the first reply.
+  // TRITON_HTTP_REPLY_QUEUE_MAX / TRITON_HTTP_REPLY_DRAIN_CMDS_MAX surfaces at
+  // startup, not mid-traffic; and register the hand-off metrics so they are
+  // exported as 0 from startup instead of appearing only after the first reply.
   DeferRetryBudgetMs();
   ReplyBatchMax();
   ReplyQueueMax();
+  ReplyDrainCmdsMax();
   InitHandoffTelemetry();
 
   // FIXME, don't cache server metadata. The http endpoint should
@@ -4098,6 +4112,20 @@ ReplyQueueMax()
   return queue_max;
 }
 
+// Drain commands a worker may have outstanding in its command pipe. evhtp
+// places new connections on the worker with the fewest pipe commands, so this
+// is how much load a busy worker is allowed to advertise: 1 only says
+// "busy/idle", larger values restore a backlog proportional to the reply rate
+// (bounded, so the pipe can never fill because of replies).
+size_t
+ReplyDrainCmdsMax()
+{
+  static const size_t cmds_max = PositiveSizeFromEnv(
+      "TRITON_HTTP_REPLY_DRAIN_CMDS_MAX",
+      ReplyQueueDefaults::kMaxPendingCommands);
+  return cmds_max;
+}
+
 // Hand-off retry/drop accounting, exported on the metrics endpoint so fleets
 // can alert on pods that will leak (drops) or run hot (retries). Also tracks
 // per-worker consecutive budget exhaustions: a worker whose command pipe
@@ -4148,6 +4176,25 @@ class DeferTelemetry {
                  "references leak; that model's next unload will wedge in "
                  "UNLOADING and hold its GPU memory. Restart this pod at the "
                  "next opportunity.";
+  }
+
+  // A queued reply reached its worker: observe how long it waited between
+  // the completion thread queuing it and the worker starting to send it. This
+  // is the leg of a request's life that nv_inference_request_duration_us does
+  // not cover (the core's clock stops when the backend's response send
+  // returns, i.e. at the hand-off), so it is where frontend delays hide.
+  void RecordHandoffWait(const uint64_t wait_ns)
+  {
+#ifdef TRITON_ENABLE_METRICS
+    if (wait_metric_ != nullptr) {
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_MetricObserve(
+              wait_metric_, static_cast<double>(wait_ns) / 1000.0),
+          "observing reply hand-off wait metric");
+    }
+#else
+    (void)wait_ns;
+#endif  // TRITON_ENABLE_METRICS
   }
 
   // One queued reply entered a worker queue (depth gauge +1).
@@ -4258,6 +4305,42 @@ class DeferTelemetry {
         "HTTP replies currently queued for delivery across workers; sustained "
         "growth means a worker is stalled",
         &depth_family_, &depth_metric_);
+    // Histogram: time from a reply being queued for its worker to the worker
+    // picking it up. Buckets in microseconds, spanning "same event-loop
+    // iteration" to "something is badly wrong".
+    {
+      static const double kBucketsUs[] = {50,    100,   250,   500,    1000,
+                                          2500,  5000,  10000, 25000,  50000,
+                                          100000, 250000, 1000000};
+      TRITONSERVER_MetricArgs* args = nullptr;
+      TRITONSERVER_Error* err = TRITONSERVER_MetricFamilyNew(
+          &wait_family_, TRITONSERVER_METRIC_KIND_HISTOGRAM,
+          "nv_http_reply_handoff_wait_us",
+          "Microseconds an HTTP reply waited between its completion thread "
+          "queuing it and its worker thread starting to send it; the leg "
+          "nv_inference_request_duration_us does not cover");
+      if (err == nullptr) {
+        err = TRITONSERVER_MetricArgsNew(&args);
+      }
+      if (err == nullptr) {
+        err = TRITONSERVER_MetricArgsSetHistogram(
+            args, kBucketsUs, sizeof(kBucketsUs) / sizeof(kBucketsUs[0]));
+      }
+      if (err == nullptr) {
+        err = TRITONSERVER_MetricNewWithArgs(
+            &wait_metric_, wait_family_, nullptr /* labels */, 0, args);
+      }
+      if (args != nullptr) {
+        LOG_TRITONSERVER_ERROR(
+            TRITONSERVER_MetricArgsDelete(args), "deleting metric args");
+      }
+      if (err != nullptr) {
+        LOG_ERROR << "failed to register nv_http_reply_handoff_wait_us metric: "
+                  << TRITONSERVER_ErrorMessage(err);
+        TRITONSERVER_ErrorDelete(err);
+        wait_metric_ = nullptr;
+      }
+    }
 #endif  // TRITON_ENABLE_METRICS
   }
 
@@ -4275,6 +4358,8 @@ class DeferTelemetry {
   TRITONSERVER_Metric* batched_metric_ = nullptr;
   TRITONSERVER_MetricFamily* depth_family_ = nullptr;
   TRITONSERVER_Metric* depth_metric_ = nullptr;
+  TRITONSERVER_MetricFamily* wait_family_ = nullptr;
+  TRITONSERVER_Metric* wait_metric_ = nullptr;
 #endif  // TRITON_ENABLE_METRICS
 };
 
@@ -4389,7 +4474,17 @@ struct PendingReply {
   TRITONSERVER_Server* server;  // for leak attribution if dropped
   std::string model_name;
   int64_t model_version;
+  uint64_t enqueued_ns;  // steady clock, for the hand-off wait histogram
 };
+
+uint64_t
+SteadyNowNs()
+{
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 
 using ReplyQueue = WorkerQueue<PendingReply>;
 
@@ -4406,7 +4501,9 @@ WorkerReplyQueue(evthr_t* thread)
 void
 WorkerInit(evhtp_t* htp, evthr_t* thread, void* arg)
 {
-  evthr_set_aux(thread, new ReplyQueue(ReplyBatchMax(), ReplyQueueMax()));
+  evthr_set_aux(
+      thread,
+      new ReplyQueue(ReplyBatchMax(), ReplyQueueMax(), ReplyDrainCmdsMax()));
 }
 
 void
@@ -4439,10 +4536,18 @@ DrainReplies(evthr_t* thread, void* arg, void* shared)
   ReplyQueue* queue = static_cast<ReplyQueue*>(arg);
   auto& telemetry = DeferTelemetry::Get();
   std::vector<PendingReply> batch;
+  int inline_drains = 0;
+  queue->BeginDrain();  // consumes the pipe command that got us here
   while (true) {
     queue->TakeBatch(&batch);
     if (!batch.empty()) {
       telemetry.RecordBatchDrained(batch.size());
+      const uint64_t now_ns = SteadyNowNs();
+      for (const auto& pending : batch) {
+        telemetry.RecordHandoffWait(
+            (now_ns > pending.enqueued_ns) ? (now_ns - pending.enqueued_ns)
+                                           : 0);
+      }
     }
     for (const auto& pending : batch) {
       // A throwing callback must not skip the rest of the batch (those
@@ -4463,26 +4568,48 @@ DrainReplies(evthr_t* thread, void* arg, void* shared)
                      "request and continuing the drain";
       }
     }
-    if (!queue->FinishBatch()) {
-      return;  // queue went idle
+    switch (queue->FinishBatch()) {
+      case DrainStep::kIdle:
+        return;  // queue went idle
+      case DrainStep::kHandedOff:
+        return;  // another drain command is already in the pipe
+      case DrainStep::kYield:
+        break;  // work remains and nothing is pending: yield or drain inline
     }
     // More work remains. Prefer to yield to the event loop so this worker's
     // other connections make progress - but with a single non-sleeping
-    // attempt and no drop telemetry: we are already on the worker thread, so
-    // a full pipe just means we keep draining inline. Going through the
-    // retrying DeferHandoff here would sleep with replies waiting and count
-    // a "drop" that never happens.
+    // attempt, and without counting a "drop", since we are already on the
+    // worker thread and a full pipe just means we keep draining inline. Going
+    // through the retrying DeferHandoff here would sleep with replies waiting.
     if (evthr_defer(thread, DrainReplies, queue) == EVTHR_RES_OK) {
+      queue->YieldWritten();
       return;
     }
+    // The yield could not be scheduled. Keep draining, but only for a bounded
+    // number of consecutive inline iterations; past that bound, back off briefly
+    // (a short sleep so the pipe can drain) and retry the yield, so the drain
+    // does not monopolise the worker indefinitely. The backoff is invisible to
+    // drop telemetry because the yield always succeeds once the pipe drains.
+    if (++inline_drains < kMaxConsecutiveInlineDrains) {
+      continue;
+    }
+    if (RetryDefer(thread, DrainReplies, queue, kDrainYieldBackoffMs,
+                   evthr_defer) == EVTHR_RES_OK) {
+      queue->YieldWritten();
+      return;
+    }
+    // Even the backed-off yield failed; drain one more batch inline and try
+    // again from the top, rather than spinning on the failed yield alone.
+    inline_drains = 0;
   }
 }
 
-// Queue a reply for 'thread' and, if no drain is pending for that worker,
-// schedule one. Returns false when the reply will never be delivered - it
-// was rejected at the depth cap, or the drain could not be scheduled - and
-// every undeliverable reply (this one and any stranded behind a failed
-// drain) has then already been reported against its own model.
+// Queue a reply for 'thread' and, while that worker has fewer than
+// TRITON_HTTP_REPLY_DRAIN_CMDS_MAX drain commands outstanding, schedule one
+// more. Returns false when the reply will never be delivered - it was rejected
+// at the depth cap, or the drain could not be scheduled and nothing else
+// covers the queue - and every undeliverable reply (this one and any stranded
+// with it) has then already been reported against its own model.
 bool
 EnqueueHandoff(
     evthr_t* thread, evthr_cb callback, void* arg, const char* site,
@@ -4496,8 +4623,8 @@ EnqueueHandoff(
         thread, callback, arg, site, server, model_name, model_version);
   }
   auto& telemetry = DeferTelemetry::Get();
-  const EnqueueResult enq = queue->Enqueue(
-      PendingReply{callback, arg, site, server, model_name, model_version});
+  const EnqueueResult enq = queue->Enqueue(PendingReply{
+      callback, arg, site, server, model_name, model_version, SteadyNowNs()});
   if (enq == EnqueueResult::kRejected) {
     // Only a worker stalled long enough to accumulate a full pipe's worth of
     // backlog reaches the cap; same drop-and-report semantics as the old
@@ -4508,21 +4635,24 @@ EnqueueHandoff(
   }
   telemetry.RecordQueued();
   if (enq == EnqueueResult::kQueued) {
-    return true;  // a drain is already scheduled for this worker
+    return true;  // enough drain commands are already outstanding
   }
-  // This enqueue armed the queue: schedule its drain (the only per-batch
-  // pipe write; retry budget and circuit breaker apply).
+  // This enqueue reserved a drain command: write it (retry budget and circuit
+  // breaker apply). It is also the worker's advertised backlog, see
+  // ReplyDrainCmdsMax().
   if (TryHandoff(thread, DrainReplies, queue, site) == EVTHR_RES_OK) {
     return true;
   }
-  // The drain could not be scheduled, so nothing will deliver what is
-  // queued: take every stranded reply out (atomically disarming, so none of
-  // them can be delivered later and contradict the report) and report each
-  // against its own model, as the pre-batching per-reply drop did. A reply
-  // another producer queued in the meantime is taken and reported too - its
-  // delivery depended on this drain.
+  // The command could not be written. If another command is still pending or
+  // a drain is running, they will deliver this reply and nothing is lost.
+  // Otherwise nothing will deliver what is queued: take every stranded reply
+  // out (atomically, so none of them can be delivered later and contradict the
+  // report) and report each against its own model, as the pre-batching
+  // per-reply drop did.
   std::vector<PendingReply> stranded;
-  queue->TakeAll(&stranded);
+  if (!queue->ArmFailed(&stranded)) {
+    return true;
+  }
   telemetry.RecordUnqueued(stranded.size());
   for (const auto& reply : stranded) {
     telemetry.RecordDrop(
