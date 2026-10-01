@@ -558,7 +558,7 @@ def backend_cmake_args(images, components, be, install_dir, library_paths):
     if be == "onnxruntime":
         args = onnxruntime_cmake_args(images, library_paths)
     elif be == "openvino":
-        args = openvino_cmake_args()
+        args = openvino_cmake_args(images)
     elif be == "dali":
         args = dali_cmake_args()
     elif be == "pytorch":
@@ -733,7 +733,7 @@ def onnxruntime_cmake_args(images, library_paths):
     return cargs
 
 
-def openvino_cmake_args():
+def openvino_cmake_args(images):
     cargs = [
         cmake_backend_arg(
             "openvino",
@@ -2209,7 +2209,14 @@ def backend_clone(
 
 
 def repo_agent_build(
-    ra, cmake_script, build_dir, install_dir, repoagent_repo, repoagents
+    ra,
+    cmake_script,
+    build_dir,
+    install_dir,
+    repoagent_repo,
+    repoagents,
+    images,
+    components,
 ):
     repo_build_dir = os.path.join(build_dir, ra, "build")
     repo_install_dir = os.path.join(build_dir, ra, "install")
@@ -2241,7 +2248,9 @@ def repo_agent_build(
     cmake_script.blankln()
 
 
-def cache_build(cache, cmake_script, build_dir, install_dir, cache_repo, caches):
+def cache_build(
+    cache, cmake_script, build_dir, install_dir, cache_repo, caches, images, components
+):
     repo_build_dir = os.path.join(build_dir, cache, "build")
     repo_install_dir = os.path.join(build_dir, cache, "install")
 
@@ -3290,6 +3299,13 @@ def resolve_build_config(args):
         "script_cmake_dir": script_cmake_dir,
         "script_name": script_name,
         "default_repo_tag": default_repo_tag,
+        "backend_org_overrides": backend_org_overrides,
+        "_bp_before_backends": _bp_before_backends,
+        "_bp_before_repoagents": _bp_before_repoagents,
+        "_bp_before_caches": _bp_before_caches,
+        "_bp_cli_extra_be": _bp_cli_extra_be,
+        "_bp_cli_override_be": _bp_cli_override_be,
+        "_bp_cli_core": _bp_cli_core,
     }
 
 
@@ -3306,6 +3322,13 @@ def run_build(config):
     script_ci_dir = config["script_ci_dir"]
     script_cmake_dir = config["script_cmake_dir"]
     script_name = config["script_name"]
+    backend_org_overrides = config["backend_org_overrides"]
+    _bp_before_backends = config["_bp_before_backends"]
+    _bp_before_repoagents = config["_bp_before_repoagents"]
+    _bp_before_caches = config["_bp_before_caches"]
+    _bp_cli_extra_be = config["_bp_cli_extra_be"]
+    _bp_cli_override_be = config["_bp_cli_override_be"]
+    _bp_cli_core = config["_bp_cli_core"]
 
     # Write the build script that invokes cmake for the core, backends, repo-agents, and caches.
     pathlib.Path(FLAGS.build_dir).mkdir(parents=True, exist_ok=True)
@@ -3319,6 +3342,7 @@ def run_build(config):
     if FLAGS.dryrun and os.getenv("TRITON_BUILD_EXPERIMENTAL") == "1":
         from tools.build import build_presets
 
+        parser = create_arg_parser()
         _bp_be = [b for b in backends if b not in CORE_BACKENDS]
         try:
             for msg in build_presets.write_snapshot(
@@ -3432,6 +3456,8 @@ def run_build(config):
                 script_install_dir,
                 repoagent_repo,
                 repoagents,
+                images,
+                components,
             )
 
         # Commands to build each cache...
@@ -3443,6 +3469,8 @@ def run_build(config):
                 script_install_dir,
                 cache_repo,
                 caches,
+                images,
+                components,
             )
 
         # Commands needed only when building with Docker...
