@@ -92,6 +92,10 @@ struct Options {
   // (single shared CQ, legacy behavior). Set to 0 for one CQ per
   // handler thread, or N>1 for N sharded CQs.
   int infer_cq_count_{1};
+  // The number of accept requests each streaming inference handler keeps
+  // outstanding, so up to this many new streams are matched without waiting
+  // for the handler thread to post the next one.
+  int stream_accept_prefetch_{16};
   // The maximum number of inference request/response objects that
   // remain allocated for reuse. As long as the number of in-flight
   // requests doesn't exceed this value there will be no

@@ -63,6 +63,7 @@ class TestGrpcOptions:
             infer_allocation_pool_size=12,
             http2_max_pings_without_data=10,
             infer_cq_count=4,
+            stream_accept_prefetch=32,
         )
 
     def test_wrong_grpc_parameters(self):
@@ -89,6 +90,10 @@ class TestGrpcOptions:
             KServeGrpc.Options(infer_cq_count=-1)
         with pytest.raises(Exception):
             KServeGrpc.Options(infer_cq_count=129)
+        with pytest.raises(Exception):
+            KServeGrpc.Options(stream_accept_prefetch=0)
+        with pytest.raises(Exception):
+            KServeGrpc.Options(stream_accept_prefetch=129)
 
         # Wrong data type
         with pytest.raises(Exception):

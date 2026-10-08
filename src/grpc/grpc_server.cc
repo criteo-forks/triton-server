@@ -2495,7 +2495,7 @@ Server::Server(
         options.infer_allocation_pool_size_ /* max_state_bucket_count */,
         options.max_response_pool_size_, options.infer_compression_level_,
         restricted_kv, options.forward_header_pattern_, &conn_mtx_, &conn_cnt_,
-        &accepting_new_conn_));
+        &accepting_new_conn_, options.stream_accept_prefetch_));
   }
 }
 
@@ -2566,6 +2566,19 @@ Server::GetOptions(Options& options, UnorderedMapType& options_map)
   if (options_map.find("infer_cq_count") != options_map.end()) {
     RETURN_IF_ERR(
         GetValue(options_map, "infer_cq_count", &options.infer_cq_count_));
+  }
+  // Read stream_accept_prefetch only if present, so a caller that builds the
+  // options map without it keeps the default.
+  if (options_map.find("stream_accept_prefetch") != options_map.end()) {
+    RETURN_IF_ERR(GetValue(
+        options_map, "stream_accept_prefetch",
+        &options.stream_accept_prefetch_));
+    if (options.stream_accept_prefetch_ < 1 ||
+        options.stream_accept_prefetch_ > 128) {
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INVALID_ARG,
+          "stream_accept_prefetch must be in the range 1 to 128");
+    }
   }
   RETURN_IF_ERR(GetValue(
       options_map, "infer_allocation_pool_size",
