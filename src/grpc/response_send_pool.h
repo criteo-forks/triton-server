@@ -25,10 +25,10 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <vector>
 
 #include "triton/common/thread_pool.h"
@@ -47,39 +47,48 @@ class ResponseSendPool {
     }
   }
 
-  // Run 'task' on the shard selected by 'key'. If the pool is
-  // draining, run the task inline on the caller's thread.
+  // Run 'task' on the shard selected by 'key'. If the pool is drained, run the
+  // task inline on the caller's thread.
   void Enqueue(const void* key, std::function<void()>&& task)
   {
-    if (draining_.load(std::memory_order_acquire)) {
-      task();
-      return;
+    {
+      // Shared lock: it only keeps Drain() from destroying a shard while a
+      // task is being pushed into it.
+      std::shared_lock<std::shared_mutex> lock(mu_);
+      if (!shards_.empty()) {
+        // std::hash on pointers is the identity in libstdc++; heap pointers
+        // are aligned so their low bits are zero and a plain modulo would
+        // collapse every key onto shard 0. Mix the bits first (the 64-bit
+        // finalizer of MurmurHash3, fmix64).
+        uintptr_t h = reinterpret_cast<uintptr_t>(key);
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        shards_[h % shards_.size()]->Enqueue(std::move(task));
+        return;
+      }
     }
-    // std::hash on pointers is the identity in libstdc++; heap pointers
-    // are aligned so their low bits are zero and a plain modulo would
-    // collapse every key onto shard 0. Mix the bits first (the 64-bit
-    // finalizer of MurmurHash3, fmix64).
-    uintptr_t h = reinterpret_cast<uintptr_t>(key);
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdULL;
-    h ^= h >> 33;
-    const size_t shard = h % shards_.size();
-    // TODO: not safe against a concurrent Drain(): this Enqueue may pass the
-    // draining_ check just before Drain() destroys 'shards_'. Drain() must
-    // only be called once no producer can still enqueue.
-    shards_[shard]->Enqueue(std::move(task));
+    task();
   }
 
-  // Complete all queued tasks and stop the shard threads. Subsequent
-  // Enqueue calls run inline.
+  // Complete all queued tasks and stop the shard threads. Safe to call while
+  // other threads still enqueue: those tasks run on a shard before it stops, or
+  // inline once the shards are gone. Subsequent Enqueue calls run inline.
   void Drain()
   {
-    draining_.store(true, std::memory_order_release);
-    shards_.clear();  // ThreadPool dtor drains its queue before joining
+    std::vector<std::unique_ptr<triton::common::ThreadPool>> shards;
+    {
+      std::unique_lock<std::shared_mutex> lock(mu_);
+      shards.swap(shards_);
+    }
+    // The ThreadPool destructor runs the queued tasks and joins the thread. It
+    // is outside the lock so that a task that enqueues more work cannot
+    // deadlock against Drain().
+    shards.clear();
   }
 
  private:
-  std::atomic<bool> draining_{false};
+  std::shared_mutex mu_;
   std::vector<std::unique_ptr<triton::common::ThreadPool>> shards_;
 };
 

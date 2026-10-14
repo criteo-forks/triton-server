@@ -190,6 +190,43 @@ TEST(ResponseSendPoolTest, PostDrainInline)
   EXPECT_EQ(task_id, caller_id);
 }
 
+// Drain() may run while other threads still enqueue (the in-process Python
+// frontend stops its server without waiting for inference threads, and a
+// SIGTERM can reach Stop() with work in flight). Every task must still run
+// exactly once, on a shard or inline once the pool is drained.
+TEST(ResponseSendPoolTest, DrainRacingWithEnqueueRunsEveryTaskOnce)
+{
+  constexpr int kRounds = 100;
+  constexpr int kProducers = 4;
+  constexpr int kTasksPerProducer = 5000;
+
+  for (int round = 0; round < kRounds; ++round) {
+    ni::ResponseSendPool pool(4);
+    std::atomic<int> executed(0);
+
+    // The producers are already enqueuing when Drain() starts, at a different
+    // point of their run each round.
+    std::vector<std::thread> producers;
+    for (int p = 0; p < kProducers; ++p) {
+      producers.emplace_back([&, p] {
+        int key = p;
+        for (int i = 0; i < kTasksPerProducer; ++i) {
+          pool.Enqueue(&key, [&] { executed.fetch_add(1); });
+        }
+      });
+    }
+
+    std::this_thread::sleep_for(std::chrono::microseconds(20 * (round % 10)));
+    pool.Drain();
+    for (auto& producer : producers) {
+      producer.join();
+    }
+
+    ASSERT_EQ(executed.load(), kProducers * kTasksPerProducer)
+        << "round " << round;
+  }
+}
+
 TEST(ResponseSendPoolTest, ShardSpread)
 {
   constexpr int kShardCount = 4;
