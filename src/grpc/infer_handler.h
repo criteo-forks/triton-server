@@ -1207,17 +1207,20 @@ class InferHandlerState {
       // core release callback has already run (it drops its own reference), so
       // the request is in RELEASED state and can be kept for the next RPC on
       // this state. The fence pairs with the release of that reference.
-      // Clear its inputs and requested outputs now, on the handler thread, so
-      // it stops referencing the RPC protobuf.
+      // Reset it without a model, on the handler thread: that clears its
+      // inputs and requested outputs, so it stops referencing the RPC
+      // protobuf, and drops the references to the model of the RPC (its own
+      // and its response factory's). A kept request must not keep a model
+      // loaded: the model could not unload, and a server shutdown would wait
+      // for the exit timeout. The next RPC resets it again with its model.
       std::atomic_thread_fence(std::memory_order_acquire);
-      LOG_TRITONSERVER_ERROR(
-          TRITONSERVER_InferenceRequestRemoveAllInputs(
-              inference_request_.get()),
-          "removing inference request inputs");
-      LOG_TRITONSERVER_ERROR(
-          TRITONSERVER_InferenceRequestRemoveAllRequestedOutputs(
-              inference_request_.get()),
-          "removing inference request requested outputs");
+      TRITONSERVER_Error* err = TRITONSERVER_InferenceRequestReset(
+          inference_request_.get(), nullptr /* server */,
+          nullptr /* model_name */, -1 /* model_version */);
+      if (err != nullptr) {
+        LOG_TRITONSERVER_ERROR(err, "resetting inference request for reuse");
+        inference_request_.reset();
+      }
     } else {
       // A live RequestReleasePayload still references the request (the core
       // release callback has not run yet, e.g. on the cancellation path), or
