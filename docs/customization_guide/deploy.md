@@ -328,3 +328,6 @@ Specifies the maximum number of inference response objects that can remain alloc
 
 > [!Warning]
 > Setting this value too low may negatively impact performance.
+
+##### `--grpc-response-send-thread-count=<integer>`
+Specifies the number of dedicated threads that complete and send unary gRPC inference responses, instead of sending them on the thread that completes the inference (a backend runner thread). The responses of one request stay ordered. The range is `0` to `128`; by default this value is `0` and responses are sent inline. The streaming inference handler is not affected.

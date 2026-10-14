@@ -59,6 +59,7 @@ class KServeGrpc:
         infer_thread_count: int
         infer_cq_count: int
         stream_accept_prefetch: int
+        response_send_thread_count: int
         infer_allocation_pool_size: int
         max_response_pool_size: int
         forward_header_pattern: str

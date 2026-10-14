@@ -33,6 +33,7 @@ add_library(
   grpc_utils.h
   infer_handler.cc
   infer_handler.h
+  response_send_pool.h
   stream_infer_handler.h
   stream_infer_handler.cc
 )
@@ -57,6 +58,7 @@ target_link_libraries(
     triton-common-logging         # from repo-common
     triton-common-table-printer   # from repo-common
     triton-common-json            # from repo-common
+    triton-common-thread-pool     # from repo-common
     grpc-health-library           # from repo-common
     grpc-service-library          # from repo-common
     triton-core-serverapi         # from repo-core
