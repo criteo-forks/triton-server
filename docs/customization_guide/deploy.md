@@ -314,7 +314,7 @@ You can configure the following parameters to balance memory usage and server pe
 - The maximum number of response objects that can stay allocated in the response queue.
 
 ##### `--grpc-infer-allocation-pool-size=<integer>`
-Specifies the maximum number of states (inference request/response queues) that remain allocated for reuse. If the number of in-flight requests does not exceed this value, no allocation or deallocation of request/response queues will occur. By default, this value is set to `8`.
+Specifies the maximum number of states (inference request/response queues) that remain allocated for reuse. If the number of in-flight requests does not exceed this value, no allocation or deallocation of request/response queues will occur. A state also keeps the inference request object of its last unary RPC for the next unary RPC on that state, so a larger value lets more RPCs reuse request objects. By default, this value is set to `8`.
 
 ##### `--grpc-max-response-pool-size=<integer>`
 Specifies the maximum number of inference response objects that can remain allocated in each response queue at any given time. This option is particularly useful in decoupled mode, where multiple responses are generated for a single request. By default, this value is set to `INT_MAX`.

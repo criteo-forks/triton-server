@@ -1201,7 +1201,29 @@ class InferHandlerState {
   void Release()
   {
     context_ = nullptr;
-    inference_request_.reset();
+    if (reuse_inference_request_ && inference_request_ &&
+        (inference_request_.use_count() == 1)) {
+      // Sole owner: either the request was never submitted to the core, or the
+      // core release callback has already run (it drops its own reference), so
+      // the request is in RELEASED state and can be kept for the next RPC on
+      // this state. The fence pairs with the release of that reference.
+      // Clear its inputs and requested outputs now, on the handler thread, so
+      // it stops referencing the RPC protobuf.
+      std::atomic_thread_fence(std::memory_order_acquire);
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_InferenceRequestRemoveAllInputs(
+              inference_request_.get()),
+          "removing inference request inputs");
+      LOG_TRITONSERVER_ERROR(
+          TRITONSERVER_InferenceRequestRemoveAllRequestedOutputs(
+              inference_request_.get()),
+          "removing inference request requested outputs");
+    } else {
+      // A live RequestReleasePayload still references the request (the core
+      // release callback has not run yet, e.g. on the cancellation path), or
+      // this state does not reuse requests.
+      inference_request_.reset();
+    }
     ClearTraceTimestamps();
   }
 
@@ -1268,6 +1290,12 @@ class InferHandlerState {
   int delay_response_complete_exec_ms_;
   int delay_enqueue_ms_;
   int delay_response_completion_ms_;
+
+  // Whether Release() keeps the inference request of a finished RPC so that the
+  // next RPC on this state resets and reuses it (ModelInferHandler::Execute()).
+  // Only the unary handler does; for the others a kept request would never be
+  // reused.
+  bool reuse_inference_request_{false};
 
   // When non-null, response completion+send is offloaded to this pool
   // instead of running inline on the backend runner thread. Set by the
