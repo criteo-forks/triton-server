@@ -453,6 +453,7 @@ if(${TRITON_ENABLE_HTTP}
     PUBLIC
       b64
       z
+      zstd
   )
 
   target_link_libraries(

@@ -501,7 +501,8 @@ SagemakerAPIServer::SageMakerMMEHandleInfer(
     auto compression_type = GetRequestCompressionType(req);
     switch (compression_type) {
       case DataCompressor::Type::DEFLATE:
-      case DataCompressor::Type::GZIP: {
+      case DataCompressor::Type::GZIP:
+      case DataCompressor::Type::ZSTD: {
         decompressed_buffer = evbuffer_new();
         err = DataCompressor::DecompressData(
             compression_type, req->buffer_in, decompressed_buffer,
@@ -513,7 +514,8 @@ SagemakerAPIServer::SageMakerMMEHandleInfer(
         // send 415 error with supported types in Accept-Encoding
         evhtp_headers_add_header(
             req->headers_out,
-            evhtp_header_new(kAcceptEncodingHTTPHeader, "gzip, deflate", 1, 1));
+            evhtp_header_new(
+                kAcceptEncodingHTTPHeader, "gzip, deflate, zstd", 1, 1));
         evhtp_send_reply(req, EVHTP_RES_UNSUPPORTED);
         return;
       }

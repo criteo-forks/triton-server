@@ -812,6 +812,231 @@ TEST_F(DataCompressorTest, DecompressionSizeLimitDeflate)
   evbuffer_free(over_compressed);
 }
 
+evbuffer*
+CompressWithZstd(const char* data, size_t size)
+{
+  auto source = evbuffer_new();
+  evbuffer_add(source, data, size);
+  auto compressed = evbuffer_new();
+  ni::DataCompressor::CompressData(
+      ni::DataCompressor::Type::ZSTD, source, compressed);
+  evbuffer_free(source);
+  return compressed;
+}
+
+evbuffer*
+SplitInTwoBuffers(evbuffer* evb)
+{
+  std::vector<char> contiguous;
+  EVBufferToContiguousBuffer(evb, &contiguous);
+  size_t half_length = contiguous.size() / 2;
+  auto first = evbuffer_new();
+  auto second = evbuffer_new();
+  evbuffer_add(first, contiguous.data(), half_length);
+  evbuffer_add(
+      second, contiguous.data() + half_length, contiguous.size() - half_length);
+  evbuffer_add_buffer(first, second);
+  evbuffer_free(second);
+  return first;
+}
+
+TEST_F(DataCompressorTest, ZstdOneBuffer)
+{
+  auto source = evbuffer_new();
+  ASSERT_EQ(evbuffer_add(source, raw_data_.get(), raw_data_length_), 0);
+  auto compressed = evbuffer_new();
+  auto decompressed = evbuffer_new();
+
+  auto err = ni::DataCompressor::CompressData(
+      ni::DataCompressor::Type::ZSTD, source, compressed);
+  ASSERT_TRUE((err == nullptr))
+      << "Failed to compress data: " << TRITONSERVER_ErrorMessage(err);
+  err = ni::DataCompressor::DecompressData(
+      ni::DataCompressor::Type::ZSTD, compressed, decompressed);
+  ASSERT_TRUE((err == nullptr))
+      << "Failed to decompress data: " << TRITONSERVER_ErrorMessage(err);
+
+  std::vector<char> res;
+  EVBufferToContiguousBuffer(decompressed, &res);
+  ASSERT_EQ(res.size(), raw_data_length_) << "Mismatched byte size";
+  ASSERT_EQ(memcmp(res.data(), raw_data_.get(), raw_data_length_), 0);
+  evbuffer_free(source);
+  evbuffer_free(compressed);
+  evbuffer_free(decompressed);
+}
+
+TEST_F(DataCompressorTest, ZstdTwoBuffer)
+{
+  auto contiguous_source = evbuffer_new();
+  ASSERT_EQ(
+      evbuffer_add(contiguous_source, raw_data_.get(), raw_data_length_), 0);
+  auto source = SplitInTwoBuffers(contiguous_source);
+  ASSERT_EQ(evbuffer_peek(source, -1, NULL, NULL, 0), 2);
+
+  auto contiguous_compressed = evbuffer_new();
+  auto err = ni::DataCompressor::CompressData(
+      ni::DataCompressor::Type::ZSTD, source, contiguous_compressed);
+  ASSERT_TRUE((err == nullptr))
+      << "Failed to compress data: " << TRITONSERVER_ErrorMessage(err);
+  auto compressed = SplitInTwoBuffers(contiguous_compressed);
+  ASSERT_EQ(evbuffer_peek(compressed, -1, NULL, NULL, 0), 2);
+
+  auto decompressed = evbuffer_new();
+  err = ni::DataCompressor::DecompressData(
+      ni::DataCompressor::Type::ZSTD, compressed, decompressed);
+  ASSERT_TRUE((err == nullptr))
+      << "Failed to decompress data: " << TRITONSERVER_ErrorMessage(err);
+
+  std::vector<char> res;
+  EVBufferToContiguousBuffer(decompressed, &res);
+  ASSERT_EQ(res.size(), raw_data_length_) << "Mismatched byte size";
+  ASSERT_EQ(memcmp(res.data(), raw_data_.get(), raw_data_length_), 0);
+  evbuffer_free(contiguous_source);
+  evbuffer_free(source);
+  evbuffer_free(contiguous_compressed);
+  evbuffer_free(compressed);
+  evbuffer_free(decompressed);
+}
+
+TEST_F(DataCompressorTest, ZstdLargeBuffer)
+{
+  std::vector<char> data(3 * MB + 17);
+  std::mt19937 rng(42);
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<char>(rng() % 16);
+  }
+  auto compressed = CompressWithZstd(data.data(), data.size());
+  ASSERT_GT(evbuffer_get_length(compressed), 0u);
+  ASSERT_LT(evbuffer_get_length(compressed), data.size());
+
+  auto decompressed = evbuffer_new();
+  auto err = ni::DataCompressor::DecompressData(
+      ni::DataCompressor::Type::ZSTD, compressed, decompressed);
+  ASSERT_TRUE((err == nullptr))
+      << "Failed to decompress data: " << TRITONSERVER_ErrorMessage(err);
+
+  std::vector<char> res;
+  EVBufferToContiguousBuffer(decompressed, &res);
+  ASSERT_EQ(res.size(), data.size()) << "Mismatched byte size";
+  ASSERT_EQ(memcmp(res.data(), data.data(), data.size()), 0);
+  evbuffer_free(compressed);
+  evbuffer_free(decompressed);
+}
+
+TEST_F(DataCompressorTest, ZstdTruncated)
+{
+  auto compressed = CompressWithZstd(raw_data_.get(), raw_data_length_);
+  size_t length = evbuffer_get_length(compressed);
+  ASSERT_GT(length, 1u);
+  std::vector<char> contiguous;
+  EVBufferToContiguousBuffer(compressed, &contiguous);
+  auto truncated = evbuffer_new();
+  evbuffer_add(truncated, contiguous.data(), length - 1);
+
+  auto decompressed = evbuffer_new();
+  auto err = ni::DataCompressor::DecompressData(
+      ni::DataCompressor::Type::ZSTD, truncated, decompressed);
+  ASSERT_TRUE((err != nullptr)) << "Truncated zstd data should fail";
+  ASSERT_EQ(TRITONSERVER_ErrorCode(err), TRITONSERVER_ERROR_INVALID_ARG);
+
+  auto valid = evbuffer_new();
+  evbuffer_add(valid, contiguous.data(), length);
+  auto decompressed_again = evbuffer_new();
+  err = ni::DataCompressor::DecompressData(
+      ni::DataCompressor::Type::ZSTD, valid, decompressed_again);
+  ASSERT_TRUE((err == nullptr))
+      << "Valid data after a failure should decompress: "
+      << TRITONSERVER_ErrorMessage(err);
+  ASSERT_EQ(evbuffer_get_length(decompressed_again), raw_data_length_);
+  evbuffer_free(compressed);
+  evbuffer_free(truncated);
+  evbuffer_free(decompressed);
+  evbuffer_free(valid);
+  evbuffer_free(decompressed_again);
+}
+
+TEST_F(DataCompressorTest, ZstdGarbage)
+{
+  auto garbage = evbuffer_new();
+  evbuffer_add(garbage, raw_data_.get(), raw_data_length_);
+  auto decompressed = evbuffer_new();
+  auto err = ni::DataCompressor::DecompressData(
+      ni::DataCompressor::Type::ZSTD, garbage, decompressed);
+  ASSERT_TRUE((err != nullptr)) << "Non-zstd data should fail";
+  ASSERT_EQ(TRITONSERVER_ErrorCode(err), TRITONSERVER_ERROR_INVALID_ARG);
+  evbuffer_free(garbage);
+  evbuffer_free(decompressed);
+}
+
+TEST_F(DataCompressorTest, DecompressionSizeLimitZstd)
+{
+  std::unique_ptr<char[]> under_data(new char[UNDER_LIMIT_DATA_SIZE]);
+  std::unique_ptr<char[]> at_data(new char[DEFAULT_MAX_INPUT_SIZE]);
+  std::unique_ptr<char[]> over_data(new char[OVER_LIMIT_DATA_SIZE]);
+  memset(under_data.get(), 'A', UNDER_LIMIT_DATA_SIZE);
+  memset(at_data.get(), 'B', DEFAULT_MAX_INPUT_SIZE);
+  memset(over_data.get(), 'C', OVER_LIMIT_DATA_SIZE);
+
+  auto under_compressed =
+      CompressWithZstd(under_data.get(), UNDER_LIMIT_DATA_SIZE);
+  auto at_compressed = CompressWithZstd(at_data.get(), DEFAULT_MAX_INPUT_SIZE);
+  auto over_compressed =
+      CompressWithZstd(over_data.get(), OVER_LIMIT_DATA_SIZE);
+
+  {
+    auto decompressed = evbuffer_new();
+    auto err = ni::DataCompressor::DecompressData(
+        ni::DataCompressor::Type::ZSTD, under_compressed, decompressed,
+        DEFAULT_MAX_INPUT_SIZE);
+    ASSERT_TRUE((err == nullptr))
+        << "63 MB data should decompress within 64 MB limit: "
+        << TRITONSERVER_ErrorMessage(err);
+    ASSERT_EQ(evbuffer_get_length(decompressed), UNDER_LIMIT_DATA_SIZE);
+    evbuffer_free(decompressed);
+  }
+
+  {
+    auto decompressed = evbuffer_new();
+    auto err = ni::DataCompressor::DecompressData(
+        ni::DataCompressor::Type::ZSTD, at_compressed, decompressed,
+        DEFAULT_MAX_INPUT_SIZE);
+    ASSERT_TRUE((err == nullptr))
+        << "64 MB data should decompress at exact 64 MB limit: "
+        << TRITONSERVER_ErrorMessage(err);
+    ASSERT_EQ(evbuffer_get_length(decompressed), DEFAULT_MAX_INPUT_SIZE);
+    evbuffer_free(decompressed);
+  }
+
+  {
+    auto decompressed = evbuffer_new();
+    auto err = ni::DataCompressor::DecompressData(
+        ni::DataCompressor::Type::ZSTD, over_compressed, decompressed,
+        DEFAULT_MAX_INPUT_SIZE);
+    ASSERT_TRUE((err != nullptr)) << "65 MB data should fail with 64 MB limit";
+    ASSERT_EQ(TRITONSERVER_ErrorCode(err), TRITONSERVER_ERROR_INVALID_ARG);
+    std::string error_msg = TRITONSERVER_ErrorMessage(err);
+    ASSERT_TRUE(
+        error_msg.find("exceeds the maximum allowed") != std::string::npos)
+        << "Error message should mention size limit: " << error_msg;
+    evbuffer_free(decompressed);
+  }
+
+  {
+    auto decompressed = evbuffer_new();
+    auto err = ni::DataCompressor::DecompressData(
+        ni::DataCompressor::Type::ZSTD, over_compressed, decompressed, 0);
+    ASSERT_TRUE((err == nullptr))
+        << "65 MB data should decompress with no limit: "
+        << TRITONSERVER_ErrorMessage(err);
+    ASSERT_EQ(evbuffer_get_length(decompressed), OVER_LIMIT_DATA_SIZE);
+    evbuffer_free(decompressed);
+  }
+
+  evbuffer_free(under_compressed);
+  evbuffer_free(at_compressed);
+  evbuffer_free(over_compressed);
+}
+
 }  // namespace
 
 int

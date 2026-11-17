@@ -27,6 +27,7 @@
 
 #include <event2/buffer.h>
 #include <zlib.h>
+#include <zstd.h>
 
 #include <cassert>
 #include <cstring>
@@ -45,7 +46,7 @@ namespace triton { namespace server {
 //
 class DataCompressor {
  public:
-  enum class Type { UNKNOWN, IDENTITY, GZIP, DEFLATE };
+  enum class Type { UNKNOWN, IDENTITY, GZIP, DEFLATE, ZSTD };
 
   // Specialization where the source and destination buffer are stored as
   // evbuffer
@@ -59,13 +60,18 @@ class DataCompressor {
           TRITONSERVER_ERROR_INVALID_ARG, "nothing to be compressed");
     }
 
+    if (type == Type::ZSTD) {
+      return CompressZstd(source, compressed_data, expected_compressed_size);
+    }
+
     z_stream stream;
     stream.zalloc = Z_NULL;
     stream.zfree = Z_NULL;
     stream.opaque = Z_NULL;
     switch (type) {
       case Type::UNKNOWN:
-      case Type::IDENTITY: {
+      case Type::IDENTITY:
+      case Type::ZSTD: {
         return TRITONSERVER_ErrorNew(
             TRITONSERVER_ERROR_INVALID_ARG, "nothing to be compressed");
       }
@@ -189,6 +195,10 @@ class DataCompressor {
         return TRITONSERVER_ErrorNew(
             TRITONSERVER_ERROR_INVALID_ARG, "nothing to be decompressed");
       }
+      case Type::ZSTD:
+        return DecompressZstd(
+            source, decompressed_data, output_buffer_size,
+            max_decompressed_size);
       case Type::GZIP:
       case Type::DEFLATE:
         // zlib can automatically detect compression type
@@ -347,6 +357,176 @@ class DataCompressor {
   }
 
  private:
+  static TRITONSERVER_Error* GetSourceBuffers(
+      evbuffer* source, std::unique_ptr<struct evbuffer_iovec[]>* holder,
+      int* buffer_count)
+  {
+    *buffer_count = evbuffer_peek(source, -1, NULL, NULL, 0);
+    if (*buffer_count > 0) {
+      holder->reset(new struct evbuffer_iovec[*buffer_count]);
+      if (evbuffer_peek(source, -1, NULL, holder->get(), *buffer_count) !=
+          *buffer_count) {
+        return TRITONSERVER_ErrorNew(
+            TRITONSERVER_ERROR_INTERNAL,
+            "unexpected error getting buffers from evbuffer");
+      }
+    }
+    return nullptr;  // success
+  }
+
+  static TRITONSERVER_Error* ZstdError(const char* what, size_t code)
+  {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG,
+        (std::string(what) + ": " + ZSTD_getErrorName(code)).c_str());
+  }
+
+  static TRITONSERVER_Error* DecompressedSizeExceeded(
+      const size_t max_decompressed_size)
+  {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG,
+        ("Decompressed data size exceeds the maximum allowed value of " +
+         std::to_string(max_decompressed_size) +
+         " bytes. Use --http-max-input-size to increase the limit.")
+            .c_str());
+  }
+
+  static TRITONSERVER_Error* CompressZstd(
+      evbuffer* source, evbuffer* compressed_data, const size_t source_size)
+  {
+    thread_local std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> cctx(
+        ZSTD_createCCtx(), ZSTD_freeCCtx);
+    if (cctx == nullptr) {
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INTERNAL,
+          "failed to initialize state for zstd data compression");
+    }
+    ZSTD_CCtx_reset(cctx.get(), ZSTD_reset_session_only);
+    size_t ret = ZSTD_CCtx_setParameter(
+        cctx.get(), ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
+    if (ZSTD_isError(ret)) {
+      return ZstdError("failed to set zstd compression level", ret);
+    }
+    ret = ZSTD_CCtx_setPledgedSrcSize(cctx.get(), source_size);
+    if (ZSTD_isError(ret)) {
+      return ZstdError("failed to set zstd source size", ret);
+    }
+
+    std::unique_ptr<struct evbuffer_iovec[]> buffer_array_holder;
+    int buffer_count = 0;
+    RETURN_IF_ERR(
+        GetSourceBuffers(source, &buffer_array_holder, &buffer_count));
+    struct evbuffer_iovec* buffer_array = buffer_array_holder.get();
+
+    const size_t output_size = ZSTD_compressBound(source_size);
+    struct evbuffer_iovec current_reserved_space;
+    RETURN_MSG_IF_ERR(
+        AllocEVBuffer(output_size, compressed_data, &current_reserved_space),
+        "unexpected error allocating output buffer for compression");
+    ZSTD_outBuffer out{current_reserved_space.iov_base, output_size, 0};
+
+    for (int idx = 0; idx < buffer_count; ++idx) {
+      ZSTD_inBuffer in{
+          buffer_array[idx].iov_base, buffer_array[idx].iov_len, 0};
+      const bool last = (idx + 1) == buffer_count;
+      const ZSTD_EndDirective mode = last ? ZSTD_e_end : ZSTD_e_continue;
+      do {
+        ret = ZSTD_compressStream2(cctx.get(), &out, &in, mode);
+        if (ZSTD_isError(ret)) {
+          ZSTD_CCtx_reset(cctx.get(), ZSTD_reset_session_only);
+          return ZstdError("zstd compression failed", ret);
+        }
+        if ((out.pos == out.size) && ((in.pos < in.size) || (last && ret))) {
+          ZSTD_CCtx_reset(cctx.get(), ZSTD_reset_session_only);
+          return TRITONSERVER_ErrorNew(
+              TRITONSERVER_ERROR_INTERNAL,
+              "zstd compressed data exceeds the compression bound");
+        }
+      } while ((in.pos < in.size) || (last && (ret != 0)));
+    }
+
+    RETURN_MSG_IF_ERR(
+        CommitEVBuffer(compressed_data, &current_reserved_space, out.pos),
+        "unexpected error committing output buffer for compression");
+    return nullptr;  // success
+  }
+
+  static TRITONSERVER_Error* DecompressZstd(
+      evbuffer* source, evbuffer* decompressed_data,
+      const size_t output_buffer_size, const size_t max_decompressed_size)
+  {
+    thread_local std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx(
+        ZSTD_createDCtx(), ZSTD_freeDCtx);
+    if (dctx == nullptr) {
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INTERNAL,
+          "failed to initialize state for zstd data decompression");
+    }
+    ZSTD_DCtx_reset(dctx.get(), ZSTD_reset_session_only);
+
+    std::unique_ptr<struct evbuffer_iovec[]> buffer_array_holder;
+    int buffer_count = 0;
+    RETURN_IF_ERR(
+        GetSourceBuffers(source, &buffer_array_holder, &buffer_count));
+    struct evbuffer_iovec* buffer_array = buffer_array_holder.get();
+
+    struct evbuffer_iovec current_reserved_space;
+    RETURN_MSG_IF_ERR(
+        AllocEVBuffer(
+            output_buffer_size, decompressed_data, &current_reserved_space),
+        "unexpected error allocating output buffer for decompression");
+    ZSTD_outBuffer out{current_reserved_space.iov_base, output_buffer_size, 0};
+    size_t total_committed = 0;
+    size_t ret = 1;
+
+    for (int idx = 0; idx < buffer_count; ++idx) {
+      ZSTD_inBuffer in{
+          buffer_array[idx].iov_base, buffer_array[idx].iov_len, 0};
+      while (true) {
+        if (out.pos == out.size) {
+          total_committed += out.size;
+          if ((max_decompressed_size > 0) &&
+              (total_committed >= max_decompressed_size)) {
+            return DecompressedSizeExceeded(max_decompressed_size);
+          }
+          RETURN_MSG_IF_ERR(
+              CommitEVBuffer(
+                  decompressed_data, &current_reserved_space, out.size),
+              "unexpected error committing output buffer for decompression");
+          size_t next_size = output_buffer_size;
+          if ((max_decompressed_size > 0) &&
+              (next_size > (max_decompressed_size - total_committed))) {
+            next_size = max_decompressed_size - total_committed;
+          }
+          RETURN_MSG_IF_ERR(
+              AllocEVBuffer(
+                  next_size, decompressed_data, &current_reserved_space),
+              "unexpected error allocating output buffer for decompression");
+          out = ZSTD_outBuffer{current_reserved_space.iov_base, next_size, 0};
+        }
+        ret = ZSTD_decompressStream(dctx.get(), &out, &in);
+        if (ZSTD_isError(ret)) {
+          ZSTD_DCtx_reset(dctx.get(), ZSTD_reset_session_only);
+          return ZstdError("zstd decompression failed", ret);
+        }
+        if ((in.pos == in.size) && ((ret == 0) || (out.pos < out.size))) {
+          break;
+        }
+      }
+    }
+    if (ret != 0) {
+      ZSTD_DCtx_reset(dctx.get(), ZSTD_reset_session_only);
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INVALID_ARG, "truncated zstd compressed data");
+    }
+
+    RETURN_MSG_IF_ERR(
+        CommitEVBuffer(decompressed_data, &current_reserved_space, out.pos),
+        "unexpected error committing output buffer for decompression");
+    return nullptr;  // success
+  }
+
   static TRITONSERVER_Error* AllocEVBuffer(
       const size_t byte_size, evbuffer* evb,
       struct evbuffer_iovec* current_reserved_space)

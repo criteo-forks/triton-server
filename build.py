@@ -1055,7 +1055,8 @@ RUN yum install -y \\
             unzip \\
             wget \\
             xz-devel \\
-            zlib-devel
+            zlib-devel \\
+            libzstd-devel
 """
     if argmap["NVIDIA_BUILD_ID"] is not None:
         df += """
@@ -1196,6 +1197,7 @@ RUN apt-get update \\
             unzip \\
             wget \\
             zlib1g-dev \\
+            libzstd-dev \\
             libarchive-dev \\
             libxml2-dev \\
             libnuma-dev \\

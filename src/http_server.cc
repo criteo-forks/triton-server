@@ -1159,7 +1159,8 @@ CompressionTypeUsed(const std::string accept_encoding)
         continue;
       }
     }
-    if (((type == "identity") || (type == "deflate") || (type == "gzip")) &&
+    if (((type == "identity") || (type == "deflate") || (type == "gzip") ||
+         (type == "zstd")) &&
         (type_weight > weight)) {
       res = type;
       weight = type_weight;
@@ -2544,6 +2545,8 @@ HTTPAPIServer::GetRequestCompressionType(evhtp_request_t* req)
       return DataCompressor::Type::DEFLATE;
     } else if (content_encoding == "gzip") {
       return DataCompressor::Type::GZIP;
+    } else if (content_encoding == "zstd") {
+      return DataCompressor::Type::ZSTD;
     } else if (!content_encoding.empty() && (content_encoding != "identity")) {
       return DataCompressor::Type::UNKNOWN;
     }
@@ -2563,6 +2566,8 @@ HTTPAPIServer::GetResponseCompressionType(evhtp_request_t* req)
       return DataCompressor::Type::DEFLATE;
     } else if (accept_encoding == "gzip") {
       return DataCompressor::Type::GZIP;
+    } else if (accept_encoding == "zstd") {
+      return DataCompressor::Type::ZSTD;
     }
   }
   return DataCompressor::Type::IDENTITY;
@@ -3353,7 +3358,8 @@ HTTPAPIServer::DecompressBuffer(
   auto compression_type = GetRequestCompressionType(req);
   switch (compression_type) {
     case DataCompressor::Type::DEFLATE:
-    case DataCompressor::Type::GZIP: {
+    case DataCompressor::Type::GZIP:
+    case DataCompressor::Type::ZSTD: {
       decompressed_buffer.reset(evbuffer_new());
       RETURN_IF_ERR(DataCompressor::DecompressData(
           compression_type, req->buffer_in, decompressed_buffer.get(),
@@ -3365,7 +3371,8 @@ HTTPAPIServer::DecompressBuffer(
       // in Accept-Encoding
       evhtp_headers_add_header(
           req->headers_out,
-          evhtp_header_new(kAcceptEncodingHTTPHeader, "gzip, deflate", 1, 1));
+          evhtp_header_new(
+              kAcceptEncodingHTTPHeader, "gzip, deflate, zstd", 1, 1));
       // FIXME: Map TRITONSERVER_ERROR_UNSUPPORTED to EVHTP_RES_UNSUPPORTED
       return TRITONSERVER_ErrorNew(
           TRITONSERVER_ERROR_UNSUPPORTED, "Unsupported compression type");
@@ -4342,7 +4349,8 @@ HTTPAPIServer::InferRequestClass::FinalizeResponse(
   evbuffer* response_body = response_placeholder;
   switch (response_compression_type_) {
     case DataCompressor::Type::DEFLATE:
-    case DataCompressor::Type::GZIP: {
+    case DataCompressor::Type::GZIP:
+    case DataCompressor::Type::ZSTD: {
       auto compressed_buffer = evbuffer_new();
       auto err = DataCompressor::CompressData(
           response_compression_type_, response_placeholder, compressed_buffer);
@@ -4397,6 +4405,11 @@ HTTPAPIServer::InferRequestClass::SetResponseHeader(
       evhtp_headers_add_header(
           req_->headers_out,
           evhtp_header_new(kContentEncodingHTTPHeader, "gzip", 1, 1));
+      break;
+    case DataCompressor::Type::ZSTD:
+      evhtp_headers_add_header(
+          req_->headers_out,
+          evhtp_header_new(kContentEncodingHTTPHeader, "zstd", 1, 1));
       break;
     case DataCompressor::Type::IDENTITY:
     case DataCompressor::Type::UNKNOWN:

@@ -69,6 +69,7 @@ if(${TRITON_ENABLE_HTTP} OR ${TRITON_ENABLE_METRICS} OR
       GTest::gtest_main
       ${LIBEVENT_LIBRARIES}
       -lz
+      -lzstd
   )
 
   install(
